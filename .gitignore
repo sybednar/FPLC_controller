@@ -1,0 +1,11 @@
+
+# Ignore virtual environments
+FPLC_client_venv/
+venv/
+__pycache__/
+*.pyc
+
+# Ignore logs and temporary files
+*.log
+*.csv
+*.png
