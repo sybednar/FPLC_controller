@@ -1,0 +1,486 @@
+
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+'''
+FPLC_client_0.2.4 (FPLC_controller) - Updated to control PumpA wash program
+
+Functions:
+1) ADS1115 ADC data acquisition
+2) Communicate with FPLC_server_GUI
+3) Threading
+4) GPIO communication
+5) MCP23017 GPIO expander control
+6) Fraction Collector control
+7) Error detection and handling
+8) PumpA wash control via MCP23017 GPA0
+'''
+
+import socket
+import threading
+import time
+import Adafruit_ADS1x15
+import gpiod
+from gpiod.line import Direction, Value, Bias
+from smbus2 import SMBus
+
+# ---------------- GPIO Control ----------------
+class GPIOControl:
+    HIGH = Value.ACTIVE
+    LOW = Value.INACTIVE
+
+    def __init__(self, chip_name, gpio_configs):
+        self.chip_name = chip_name
+        self.gpio_configs = gpio_configs
+        self.request = {}
+        self.setup_gpio()
+
+    def setup_gpio(self):
+        for line_num, config in self.gpio_configs.items():
+            initial_value = self.HIGH if config.get('initial_state') == 'HIGH' else self.LOW
+            line_settings = gpiod.LineSettings(
+                direction=config['direction'],
+                output_value=initial_value if config['direction'] == Direction.OUTPUT else self.LOW,
+                bias=config.get('bias', Bias.DISABLED)
+            )
+            self.request[line_num] = gpiod.request_lines(
+                f"/dev/{self.chip_name}",
+                consumer="gpio_control",
+                config={line_num: line_settings}
+            )
+
+    def set_value(self, line_num, value):
+        try:
+            self.request[line_num].set_value(line_num, value)
+        except PermissionError as e:
+            print(f"Permission error: {e}")
+
+    def get_value(self, line_num):
+        return self.request[line_num].get_value(line_num)
+
+    def monitor_input(self, line_num):
+        value = self.get_value(line_num)
+        return "HIGH" if value == self.HIGH else "LOW"
+
+    def clear_gpio(self):
+        for line_num in self.request:
+            self.set_value(line_num, self.LOW)
+
+# ---------------- MCP23017 Control ----------------
+class MCP23017:
+    def __init__(self, bus, address):
+        self.bus = bus
+        self.address = address
+        self.IODIRA = 0x00# I/O direction register for port A
+        self.IODIRB = 0x01# I/O direction register for port B
+        self.OLATA = 0x14# Output latch register for port A
+        self.OLATB = 0x15# Output latch register for port B
+        self.GPPUA = 0x0C# Pull-up resistor config for port A
+
+        # Set GPA0 as output (bit 0 = 0), GPA7 as input (bit 7 = 1)
+        self.bus.write_byte_data(self.address, self.IODIRA, 0b10000000)
+
+        # Enable pull-up on GPA7 (bit 7 = 1)
+        self.bus.write_byte_data(self.address, self.GPPUA, 0b10000000)
+
+        # Optionally initialize GPA0 to HIGH (inactive wash)
+        self.set_pin_high('A', 0)
+
+        # Set all A and B pins as outputs
+        #self.bus.write_byte_data(self.address, self.IODIRA, 0x00)
+        #self.bus.write_byte_data(self.address, self.IODIRB, 0x00)
+
+    def set_pin_low(self, port, pin):
+        if port == 'A':
+            current_value = self.bus.read_byte_data(self.address, self.OLATA)
+            new_value = current_value & ~(1 << pin)
+            self.bus.write_byte_data(self.address, self.OLATA, new_value)
+        elif port == 'B':
+            current_value = self.bus.read_byte_data(self.address, self.OLATB)
+            new_value = current_value & ~(1 << pin)
+            self.bus.write_byte_data(self.address, self.OLATB, new_value)
+
+    def set_pin_high(self, port, pin):
+        if port == 'A':
+            current_value = self.bus.read_byte_data(self.address, self.OLATA)
+            new_value = current_value | (1 << pin)
+            self.bus.write_byte_data(self.address, self.OLATA, new_value)
+        elif port == 'B':
+            current_value = self.bus.read_byte_data(self.address, self.OLATB)
+            new_value = current_value | (1 << pin)
+            self.bus.write_byte_data(self.address, self.OLATB, new_value)
+            
+    def read_pin(self, port, pin):
+        if port == 'A':
+            gpio_state = self.bus.read_byte_data(self.address, 0x12)# GPIOA register
+        elif port == 'B':
+            gpio_state = self.bus.read_byte_data(self.address, 0x13)# GPIOB register
+        else:
+            raise ValueError("Invalid port. Use 'A' or 'B'.")
+        return (gpio_state >> pin) & 0x01
+
+# ---------------- PumpA Control ----------------
+
+class PumpA:
+    def __init__(self, mcp, sock):
+        self.mcp = mcp
+        self.sock = sock
+        self.port = 'A'
+        self.pin_wash = 0# GPA0 controls wash start
+        self.pin_status = 7# GPA7 monitors wash status
+
+    def start_wash(self):
+        print("PumpA wash started")
+        self.mcp.set_pin_low(self.port, self.pin_wash)# Activate wash
+        if self.mcp.read_pin(self.port, self.pin_status) == 0:
+            print("pumpA wash program activated")
+
+    def monitor_wash(self):
+        # Continuously monitor GPA7 while GPA0 is LOW
+        while self.mcp.read_pin(self.port, self.pin_wash) == 0:
+            if self.mcp.read_pin(self.port, self.pin_status) == 1:
+                self.mcp.set_pin_high(self.port, self.pin_wash)# Deactivate wash
+                print("pumpA wash program complete")
+                try:
+                    self.sock.sendall("PUMP_A_WASH_COMPLETED".encode('utf-8'))
+                    print("Sent wash completion message to server")
+                except socket.error as e:
+                    print(f"Socket send error: {e}")
+                break
+            time.sleep(0.5)# Polling interval
+
+
+# ---------------- Base Thread ----------------
+class BaseThread:
+    def __init__(self):
+        self.pause_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def start(self):
+        if self.thread is None or not self.thread.is_alive():
+            self.thread = threading.Thread(target=self.run)
+            self.thread.start()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            self.pause_event.wait()
+            self.perform_task()
+            time.sleep(0.1)
+
+    def stop(self):
+        self.stop_event.set()
+        self.pause_event.set()
+        if self.thread is not None and self.thread.is_alive():
+            if threading.current_thread() != self.thread:
+                self.thread.join()
+        self.thread = None
+
+    def pause(self):
+        self.pause_event.clear()
+
+    def resume(self):
+        self.pause_event.set()
+
+    def perform_task(self):
+        raise NotImplementedError("Subclasses should implement this method")
+
+# ---------------- Data Acquisition ----------------
+class DataAcquisition(BaseThread):
+    def __init__(self, adc, gain, sampling_rate, sock, gpio_monitor):
+        super().__init__()
+        self.adc = adc
+        self.gain = gain
+        self.sampling_rate = sampling_rate
+        self.sock = sock
+        self.gpio_monitor = gpio_monitor
+        self.flowrate = 0.0
+        self.pause_start_time = None
+        self.total_pause_duration = 0
+        self.frac_collector_running = False
+        self.frac_collector_start_time = None
+
+    def set_flowrate(self, flowrate):
+        self.flowrate = flowrate
+
+    def perform_task(self):
+        start_time = time.time()
+        previous_Frac_Mark_value = 0.0
+        while not self.stop_event.is_set():
+            self.pause_event.wait()
+            try:
+                value1 = self.adc.read_adc(0, gain=self.gain)
+                value2 = self.adc.read_adc(1, gain=self.gain)
+                gpio12_status = self.gpio_monitor.monitor_input(12)
+            except Exception as e:
+                print(f"ADC read error: {e}")
+                continue
+
+            elapsed_time = time.time() - start_time - self.total_pause_duration
+            eluate_volume = elapsed_time * (self.flowrate / 60)
+
+            if gpio12_status == 'LOW' and not self.frac_collector_running:
+                self.frac_collector_running = True
+                self.frac_collector_start_time = time.time()
+                print("Fraction collector started running")
+
+            if elapsed_time >= 1 and not self.frac_collector_running:
+                print("Fraction collector not running")
+
+            if gpio12_status == 'LOW' and previous_Frac_Mark_value == 0.0:
+                Frac_Mark = 1.0
+                previous_Frac_Mark_value = Frac_Mark
+            else:
+                Frac_Mark = 0.0
+                previous_Frac_Mark_value = Frac_Mark
+
+            data = f"{value1},{value2},{elapsed_time},{eluate_volume},{Frac_Mark}"
+            try:
+                self.sock.sendall(data.encode('utf-8'))
+            except socket.error as e:
+                print(f"Socket send error: {e}")
+                break
+
+            print(f"Elapsed_Time: {elapsed_time:.2f} sec, Eluate_Volume: {eluate_volume:.4f} mls, Chan1: {value1}, Chan2: {value2}, GPIO12: {gpio12_status}")
+            time.sleep(1 / self.sampling_rate)
+
+    def pause(self):
+        self.pause_start_time = time.time()
+        self.pause_event.clear()
+
+    def resume(self):
+        if self.pause_start_time is not None:
+            pause_duration = time.time() - self.pause_start_time
+            self.total_pause_duration += pause_duration
+            self.pause_start_time = None
+        self.pause_event.set()
+
+# ---------------- Fraction Collector ----------------
+class FractionCollector(BaseThread):
+    def __init__(self, gpio_control, sock):
+        super().__init__()
+        self.gpio_control = gpio_control
+        self.sock = sock
+        self.error_detected = False
+        self.pins = {
+            'operable_in': 5,
+            'start_stop': 6,
+            'pause_resume': 13,
+            'operable_out': 16,
+            'error': 26
+        }
+
+    def perform_task(self):
+        self.monitor_error()
+        if self.error_detected:
+            self.monitor_error_cleared()
+
+    def set_pin(self, pin_name, value):
+        self.gpio_control.set_value(self.pins[pin_name], value)
+
+    def get_pin_status(self, pin_name):
+        return self.gpio_control.monitor_input(self.pins[pin_name])
+
+    def print_status(self, pin_name):
+        status = self.get_pin_status(pin_name)
+        print(f"GPIO{self.pins[pin_name]} status: {status}")
+
+    def monitor_error(self):
+        if self.get_pin_status('error') == "LOW":
+            print("Fraction Collector ERROR has occurred")
+            self.print_status('error')
+            self.stop_fraction_collector()
+            self.stop()
+            self.set_pin('start_stop', GPIOControl.HIGH)
+            data_acquisition.stop()
+            self.send_error_notification()
+            self.error_detected = True
+
+    def monitor_error_cleared(self):
+        while self.get_pin_status('error') == "LOW":
+            time.sleep(1)
+        print("Fraction Collector Error has been cleared")
+        self.send_error_cleared_notification()
+        self.error_detected = False
+
+    def send_error_notification(self):
+        try:
+            self.sock.sendall("Fraction Collector error".encode('utf-8'))
+            print("Error notification sent to server")
+        except socket.error as e:
+            print(f"Socket send error: {e}")
+
+    def send_error_cleared_notification(self):
+        try:
+            self.sock.sendall("Fraction Collector Error has been cleared".encode('utf-8'))
+            print("Error cleared notification sent to server")
+        except socket.error as e:
+            print(f"Socket send error: {e}")
+
+    def start_fraction_collector(self):
+        self.set_pin('start_stop', GPIOControl.LOW)
+        self.print_status('operable_out')
+
+    def stop_fraction_collector(self):
+        if self.get_pin_status('operable_out') == "LOW":
+            self.set_pin('start_stop', GPIOControl.HIGH)
+            print("Fraction collector stopped")
+
+    def pause_fraction_collector(self):
+        if self.get_pin_status('operable_out') == "LOW" and self.get_pin_status('start_stop') == "LOW":
+            self.set_pin('pause_resume', GPIOControl.LOW)
+            print("Fraction collector paused")
+
+    def resume_fraction_collector(self):
+        if (self.get_pin_status('operable_out') == "LOW" and
+            self.get_pin_status('start_stop') == "LOW" and
+            self.get_pin_status('pause_resume') == "LOW"):
+            self.set_pin('pause_resume', GPIOControl.HIGH)
+            print("Fraction collector resumed")
+
+# ---------------- Error Detection ----------------
+class ErrorDetection(BaseThread):
+    def __init__(self, gpio_control, error_pins, sock):
+        super().__init__()
+        self.gpio_control = gpio_control
+        self.error_pins = error_pins
+        self.sock = sock
+
+    def perform_task(self):
+        for pin_name, pin_num in self.error_pins.items():
+            if self.gpio_control.monitor_input(pin_num) == "LOW":
+                print(f"{pin_name} error has occurred")
+                self.handle_error(pin_name)
+
+    def handle_error(self, pin_name):
+        if pin_name == 'fraction_collector_error':
+            fraction_collector.stop_fraction_collector()
+            fraction_collector.stop()
+            fraction_collector.set_pin('start_stop', GPIOControl.HIGH)
+            data_acquisition.stop()
+            fraction_collector.send_error_notification()
+
+    def handle_heartbeat(self):
+        try:
+            self.sock.sendall('HEARTBEAT_ACK'.encode('utf-8'))
+        except socket.error as e:
+            print(f"Socket send error: {e}")
+
+# ---------------- Main Script ----------------
+if __name__ == '__main__':
+    adc = Adafruit_ADS1x15.ADS1115(busnum=1)
+    GAIN = 16
+    sampling_rate = 10
+    server_ip = '128.104.117.228'
+    server_port = 5000
+
+    # Connect to server
+    while True:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.connect((server_ip, server_port))
+            print("Connected to server")
+            break
+        except socket.error:
+            print("Client trying to connect to server...")
+            time.sleep(2)
+
+    gpio_configs = {
+        5: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
+        6: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
+        13: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
+        12: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
+        16: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
+        26: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
+        17: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'}
+    }
+
+    gpio_monitor = GPIOControl('gpiochip0', gpio_configs)
+    gpio_monitor.set_value(17, GPIOControl.LOW)
+    gpio_monitor.set_value(5, GPIOControl.LOW)
+
+    data_acquisition = DataAcquisition(adc, GAIN, sampling_rate, sock, gpio_monitor)
+    fraction_collector = FractionCollector(gpio_monitor, sock)
+    error_pins = {'fraction_collector_error': 26}
+    error_detection = ErrorDetection(gpio_monitor, error_pins, sock)
+
+    bus = SMBus(1)
+    mcp = MCP23017(bus, 0x21)
+    mcp.set_pin_high('A', 0)# Set GPA0 HIGH to keep wash program inactive at startup
+    pump_a = PumpA(mcp, sock)
+
+    try:
+        while True:
+            signal = sock.recv(1024).decode('utf-8')
+
+            if signal.startswith("FLOWRATE:"):
+                flowrate_value = float(signal.split(":")[1])
+                data_acquisition.set_flowrate(flowrate_value)
+                print(f"Received flowrate: {flowrate_value} ml/min")
+
+            elif signal.startswith("PumpA_Volume:"):
+                PumpA_volume_value = float(signal.split(":")[1])
+                print(f"Received PumpA volume: {PumpA_volume_value} ml")
+
+            elif signal == "WASH_PUMP_A":
+                print("Received Wash_PumpA signal")
+                pump_a.start_wash()
+                pump_a.monitor_wash()
+                #time.sleep(10)  # Duration of wash cycle
+                #pump_a.stop_wash()
+
+            elif signal == "WASH_PUMP_B":
+                print("Received Wash_PumpB signal")
+
+            elif signal == "START_PUMPS":
+                print("Received start_pumps signal")
+
+            elif signal == "STOP_PUMPS":
+                print("Received stop_pumps signal")
+
+            elif signal == "START_ADC":
+                print("Received START_ADC signal")
+                data_acquisition.stop_event.clear()
+                data_acquisition.resume()
+                data_acquisition.start()
+                fraction_collector.stop_event.clear()
+                fraction_collector.resume()
+                fraction_collector.start()
+                fraction_collector.start_fraction_collector()
+                error_detection.start()
+
+            elif signal == "STOP_ADC":
+                print("Received STOP_ADC signal")
+                data_acquisition.stop()
+                data_acquisition.frac_collector_running = False
+                data_acquisition.frac_collector_start_time = None
+                fraction_collector.stop()
+                fraction_collector.stop_fraction_collector()
+                error_detection.stop()
+
+            elif signal == "PAUSE_ADC":
+                print("Received PAUSE_ADC signal")
+                data_acquisition.pause()
+                fraction_collector.pause()
+                fraction_collector.pause_fraction_collector()
+
+            elif signal == "RESUME_ADC":
+                print("Received RESUME_ADC signal")
+                data_acquisition.resume()
+                fraction_collector.resume()
+                fraction_collector.resume_fraction_collector()
+
+            elif signal == "HEARTBEAT":
+                error_detection.handle_heartbeat()
+
+            fraction_collector.monitor_error()
+
+    except socket.error as e:
+        print(f"Socket error: {e}")
+
+    finally:
+        sock.close()
+        data_acquisition.stop()
+        fraction_collector.stop()
+        fraction_collector.stop_fraction_collector()
+        error_detection.stop()
+        gpio_monitor.clear_gpio()
