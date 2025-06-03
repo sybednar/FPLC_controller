@@ -2,7 +2,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 '''
-FPLC_client_0.2.4 (FPLC_controller) - Updated to control PumpA wash program
+FPLC_client_0.2.5 (FPLC_controller) - Updated to control PumpA flowrate and run
 
 Functions:
 1) ADS1115 ADC data acquisition
@@ -13,6 +13,8 @@ Functions:
 6) Fraction Collector control
 7) Error detection and handling
 8) PumpA wash control via MCP23017 GPA0
+9) added valve control signal reception from FPLC_server
+
 '''
 
 import socket
@@ -22,6 +24,7 @@ import Adafruit_ADS1x15
 import gpiod
 from gpiod.line import Direction, Value, Bias
 from smbus2 import SMBus
+from mv7_valve_controller import MV7ValveController
 
 # ---------------- GPIO Control ----------------
 class GPIOControl:
@@ -76,14 +79,15 @@ class MCP23017:
         self.OLATB = 0x15# Output latch register for port B
         self.GPPUA = 0x0C# Pull-up resistor config for port A
 
-        # Set GPA0 as output (bit 0 = 0), GPA7 as input (bit 7 = 1)
+        # Set GPA0, GPA1, GPA2 as outputs (bits 0?2 = 0), GPA7 as input (bit 7 = 1)
         self.bus.write_byte_data(self.address, self.IODIRA, 0b10000000)
 
         # Enable pull-up on GPA7 (bit 7 = 1)
         self.bus.write_byte_data(self.address, self.GPPUA, 0b10000000)
 
-        # Optionally initialize GPA0 to HIGH (inactive wash)
-        self.set_pin_high('A', 0)
+        
+        self.set_pin_high('A', 0) #initialize GPA0 to HIGH (inactive wash)
+        self.set_pin_high('A', 2) #initialize GPA2 to HIGH (internal speed control)
 
         # Set all A and B pins as outputs
         #self.bus.write_byte_data(self.address, self.IODIRA, 0x00)
@@ -117,6 +121,14 @@ class MCP23017:
         else:
             raise ValueError("Invalid port. Use 'A' or 'B'.")
         return (gpio_state >> pin) & 0x01
+    
+    def clear_all_outputs(self):
+        # Set all output pins on both ports to LOW
+        self.bus.write_byte_data(self.address, self.OLATA, 0x00)
+        self.bus.write_byte_data(self.address, self.OLATB, 0x00)
+        print("MCP23017: All outputs cleared (set to LOW)")
+
+
 
 # ---------------- PumpA Control ----------------
 
@@ -147,6 +159,75 @@ class PumpA:
                     print(f"Socket send error: {e}")
                 break
             time.sleep(0.5)# Polling interval
+
+
+# ---------------- PumpA Flowrate Controller ----------------
+class PumpAFlowrateController:
+    def __init__(self, gpio_control, gpio_pin, mcp):
+        self.gpio_control = gpio_control
+        self.gpio_pin = gpio_pin
+        self.mcp = mcp
+        self.flowrate = 0.0
+        self.thread = None
+        self.stop_event = threading.Event()
+        self.pump_runtime = 0.0
+        self.volume_output = 0.0
+        self.PumpA_volume_value = 0.0
+
+    def set_flowrate(self, flowrate):
+        self.flowrate = flowrate
+        
+    def set_volume_value(self, volume_value):
+        self.PumpA_volume_value = volume_value
+
+    def calculate_period(self):
+        frequency = self.flowrate * 18.315
+        frequency = max(0, min(frequency, 153))
+        return 1.0 / frequency if frequency > 0 else None
+
+    def start(self):
+        if self.thread is None or not self.thread.is_alive():
+            
+            print("Starting PumpA flowrate controller thread")
+
+            self.stop_event.clear()
+            self.thread = threading.Thread(target=self.run)
+            self.thread.start()
+
+    def run(self):
+        start_time = time.time()
+        while not self.stop_event.is_set():
+            period = self.calculate_period()
+            if period is None:
+                self.gpio_control.set_value(self.gpio_pin, GPIOControl.LOW)
+                time.sleep(0.1)
+                continue
+            half_period = period / 2.0
+            self.gpio_control.set_value(self.gpio_pin, GPIOControl.HIGH)
+            time.sleep(half_period)
+            self.gpio_control.set_value(self.gpio_pin, GPIOControl.LOW)
+            time.sleep(half_period)
+            print(f"Toggling GPIO{self.gpio_pin} at {1/period:.2f} Hz")
+            
+            # Calculate runtime and volume output
+            self.pump_runtime = time.time() - start_time
+            self.volume_output = (self.flowrate/60) * self.pump_runtime
+
+            # Check if volume output has reached the target
+            if self.volume_output >= self.PumpA_volume_value:
+                print(f"Volume output {self.volume_output:.2f} ml has reached the target {self.PumpA_volume_value:.2f} ml")
+                self.mcp.set_pin_low('A', 1)# GPA1 LOW
+                self.mcp.set_pin_high('A', 2)# GPA2 HIGH
+                self.gpio_control.set_value(self.gpio_pin, GPIOControl.LOW)# GPIO13 LOW
+                self.stop()
+
+    def stop(self):
+        self.stop_event.set()
+        if self.thread is not None and self.thread.is_alive():
+            if threading.current_thread() != self.thread:
+                self.thread.join()
+        self.gpio_control.set_value(self.gpio_pin, GPIOControl.LOW)
+        self.thread = None
 
 
 # ---------------- Base Thread ----------------
@@ -210,7 +291,7 @@ class DataAcquisition(BaseThread):
             try:
                 value1 = self.adc.read_adc(0, gain=self.gain)
                 value2 = self.adc.read_adc(1, gain=self.gain)
-                gpio12_status = self.gpio_monitor.monitor_input(12)
+                gpio23_status = self.gpio_monitor.monitor_input(23)
             except Exception as e:
                 print(f"ADC read error: {e}")
                 continue
@@ -218,7 +299,7 @@ class DataAcquisition(BaseThread):
             elapsed_time = time.time() - start_time - self.total_pause_duration
             eluate_volume = elapsed_time * (self.flowrate / 60)
 
-            if gpio12_status == 'LOW' and not self.frac_collector_running:
+            if gpio23_status == 'LOW' and not self.frac_collector_running:
                 self.frac_collector_running = True
                 self.frac_collector_start_time = time.time()
                 print("Fraction collector started running")
@@ -226,7 +307,7 @@ class DataAcquisition(BaseThread):
             if elapsed_time >= 1 and not self.frac_collector_running:
                 print("Fraction collector not running")
 
-            if gpio12_status == 'LOW' and previous_Frac_Mark_value == 0.0:
+            if gpio23_status == 'LOW' and previous_Frac_Mark_value == 0.0:
                 Frac_Mark = 1.0
                 previous_Frac_Mark_value = Frac_Mark
             else:
@@ -240,7 +321,7 @@ class DataAcquisition(BaseThread):
                 print(f"Socket send error: {e}")
                 break
 
-            print(f"Elapsed_Time: {elapsed_time:.2f} sec, Eluate_Volume: {eluate_volume:.4f} mls, Chan1: {value1}, Chan2: {value2}, GPIO12: {gpio12_status}")
+            print(f"Elapsed_Time: {elapsed_time:.2f} sec, Eluate_Volume: {eluate_volume:.4f} mls, Chan1: {value1}, Chan2: {value2}, GPIO23: {gpio23_status}")
             time.sleep(1 / self.sampling_rate)
 
     def pause(self):
@@ -264,7 +345,7 @@ class FractionCollector(BaseThread):
         self.pins = {
             'operable_in': 5,
             'start_stop': 6,
-            'pause_resume': 13,
+            'pause_resume': 22,
             'operable_out': 16,
             'error': 26
         }
@@ -344,12 +425,29 @@ class ErrorDetection(BaseThread):
         self.gpio_control = gpio_control
         self.error_pins = error_pins
         self.sock = sock
+        self.error_active = {}
+        
+        for pin_name, pin_num in self.error_pins.items():
+            state = self.gpio_control.monitor_input(pin_num)
+            self.error_active[pin_name] = (state == "LOW")
+            self.previous_error_state = state
+
+            if state == "LOW":
+                print(f"[Startup] {pin_name} already in error state (GPIO{pin_num} LOW)")
+                self.handle_error(pin_name)
 
     def perform_task(self):
+        print("[ErrorDetection] perform_task running...")
         for pin_name, pin_num in self.error_pins.items():
-            if self.gpio_control.monitor_input(pin_num) == "LOW":
-                print(f"{pin_name} error has occurred")
+            current_state = self.gpio_control.monitor_input(pin_num)
+            if current_state == "LOW" and not self.error_active[pin_name]:
+                print(f"[ErrorDetection] {pin_name} error has occurred")
                 self.handle_error(pin_name)
+                self.error_active[pin_name] = True
+            elif current_state == "HIGH" and self.error_active[pin_name]:
+                print(f"[ErrorDetection] {pin_name} error has cleared")
+                self.send_error_cleared_notification()
+                self.error_active[pin_name] = False
 
     def handle_error(self, pin_name):
         if pin_name == 'fraction_collector_error':
@@ -357,13 +455,56 @@ class ErrorDetection(BaseThread):
             fraction_collector.stop()
             fraction_collector.set_pin('start_stop', GPIOControl.HIGH)
             data_acquisition.stop()
-            fraction_collector.send_error_notification()
+            self.send_error_notification()
+            self.resume()
 
-    def handle_heartbeat(self):
+    def send_error_notification(self):
         try:
-            self.sock.sendall('HEARTBEAT_ACK'.encode('utf-8'))
+            self.sock.sendall("Fraction Collector error".encode('utf-8'))
+            print("Error notification sent to server")
         except socket.error as e:
             print(f"Socket send error: {e}")
+
+    def send_error_cleared_notification(self):
+        try:
+            self.sock.sendall("Fraction Collector Error has been cleared".encode('utf-8'))
+            print("Error cleared notification sent to server")
+        except socket.error as e:
+            print(f"Socket send error: {e}")
+
+
+# ---------------- Heartbeat handling ----------------
+class HeartbeatSender(threading.Thread):
+    def __init__(self, sock, interval=5):
+        super().__init__(daemon=True)
+        self.sock = sock
+        self.interval = interval
+        self.running = True
+
+    def run(self):
+        while self.running:
+            try:
+                self.sock.sendall("HEARTBEAT".encode('utf-8'))
+                print("[Client] Sent HEARTBEAT")
+            except socket.error as e:
+                print(f"[Client] Heartbeat send error: {e}")
+                break
+            time.sleep(self.interval)
+
+    def stop(self):
+        self.running = False
+
+# ---------------- Thread Health Monitor ----------------
+def monitor_thread_health(thread, name):
+    def monitor():
+        while True:
+            if thread.thread and thread.thread.is_alive():
+                print(f"[Monitor] {name} thread is alive.")
+            else:
+                print(f"[Monitor] {name} thread is NOT running! Restarting...")
+                thread.start()
+                time.sleep(10)# Check every 10 seconds
+                threading.Thread(target=monitor, daemon=True).start()
 
 # ---------------- Main Script ----------------
 if __name__ == '__main__':
@@ -379,34 +520,50 @@ if __name__ == '__main__':
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((server_ip, server_port))
             print("Connected to server")
+            heartbeat_sender = HeartbeatSender(sock)
+            heartbeat_sender.start()
+                      
+
+            gpio_configs = {
+                5: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
+                6: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
+                22: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
+                23: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
+                16: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
+                26: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
+                17: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'},
+                13: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'},
+                4: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
+                17: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
+                27: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'}
+            }
+
+            gpio_monitor = GPIOControl('gpiochip0', gpio_configs)
+            #gpio_monitor.set_value(17, GPIOControl.LOW)
+            gpio_monitor.set_value(5, GPIOControl.LOW)
+            
+
+            data_acquisition = DataAcquisition(adc, GAIN, sampling_rate, sock, gpio_monitor)
+            fraction_collector = FractionCollector(gpio_monitor, sock)
+            error_pins = {'fraction_collector_error': 26}
+            error_detection = ErrorDetection(gpio_monitor, error_pins, sock)
+            error_detection.start()
+            monitor_thread_health(error_detection, "ErrorDetection")
+
+            bus = SMBus(1)
+            mcp = MCP23017(bus, 0x21)
+            mcp.set_pin_high('A', 0)# Set GPA0 HIGH to keep wash program inactive at startup
+            mcp.set_pin_high('A', 2)# Set GPA2 HIGH to keep wash program inactive at startup
+
+            pump_a = PumpA(mcp, sock)
+            pump_a_flowrate_controller = PumpAFlowrateController(gpio_monitor, 13, mcp)
+
+            valve_controller = MV7ValveController(gpio_monitor, mcp)
+
             break
         except socket.error:
             print("Client trying to connect to server...")
             time.sleep(2)
-
-    gpio_configs = {
-        5: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
-        6: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
-        13: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
-        12: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
-        16: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
-        26: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
-        17: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'}
-    }
-
-    gpio_monitor = GPIOControl('gpiochip0', gpio_configs)
-    gpio_monitor.set_value(17, GPIOControl.LOW)
-    gpio_monitor.set_value(5, GPIOControl.LOW)
-
-    data_acquisition = DataAcquisition(adc, GAIN, sampling_rate, sock, gpio_monitor)
-    fraction_collector = FractionCollector(gpio_monitor, sock)
-    error_pins = {'fraction_collector_error': 26}
-    error_detection = ErrorDetection(gpio_monitor, error_pins, sock)
-
-    bus = SMBus(1)
-    mcp = MCP23017(bus, 0x21)
-    mcp.set_pin_high('A', 0)# Set GPA0 HIGH to keep wash program inactive at startup
-    pump_a = PumpA(mcp, sock)
 
     try:
         while True:
@@ -415,10 +572,12 @@ if __name__ == '__main__':
             if signal.startswith("FLOWRATE:"):
                 flowrate_value = float(signal.split(":")[1])
                 data_acquisition.set_flowrate(flowrate_value)
+                pump_a_flowrate_controller.set_flowrate(flowrate_value)
                 print(f"Received flowrate: {flowrate_value} ml/min")
 
             elif signal.startswith("PumpA_Volume:"):
                 PumpA_volume_value = float(signal.split(":")[1])
+                pump_a_flowrate_controller.set_volume_value(PumpA_volume_value)
                 print(f"Received PumpA volume: {PumpA_volume_value} ml")
 
             elif signal == "WASH_PUMP_A":
@@ -433,9 +592,16 @@ if __name__ == '__main__':
 
             elif signal == "START_PUMPS":
                 print("Received start_pumps signal")
+                mcp.set_pin_high('A', 1)# GPA1 HIGH = Run
+                mcp.set_pin_low('A', 2)# GPA2 LOW = Enable external speed control
+                pump_a_flowrate_controller.start()
+                monitor_thread_health(pump_a_flowrate_controller, "PumpAFlowrateController")
 
             elif signal == "STOP_PUMPS":
                 print("Received stop_pumps signal")
+                mcp.set_pin_low('A', 1)# GPA1 LOW = Standby
+                mcp.set_pin_high('A', 2)# GPA2 HIGH = Disable external speed control
+                pump_a_flowrate_controller.stop()
 
             elif signal == "START_ADC":
                 print("Received START_ADC signal")
@@ -447,6 +613,8 @@ if __name__ == '__main__':
                 fraction_collector.start()
                 fraction_collector.start_fraction_collector()
                 error_detection.start()
+                monitor_thread_health(data_acquisition, "DataAcquisition")
+                monitor_thread_health(fraction_collector, "FractionCollector")
 
             elif signal == "STOP_ADC":
                 print("Received STOP_ADC signal")
@@ -468,19 +636,32 @@ if __name__ == '__main__':
                 data_acquisition.resume()
                 fraction_collector.resume()
                 fraction_collector.resume_fraction_collector()
+                
+            elif signal.startswith("System_Valve_Position:"):
+                valve_position = signal.split(":")[1]
+                print(f"Received System Valve Position: {valve_position}")
+                try:
+                    valve_controller.move_to_position(valve_position)
+                except Exception as e:
+                    print(f"Valve movement error: {e}")
 
             elif signal == "HEARTBEAT":
                 error_detection.handle_heartbeat()
 
-            fraction_collector.monitor_error()
+            #fraction_collector.monitor_error()
 
     except socket.error as e:
         print(f"Socket error: {e}")
 
     finally:
-        sock.close()
+        heartbeat_sender.stop()
         data_acquisition.stop()
         fraction_collector.stop()
         fraction_collector.stop_fraction_collector()
+        valve_controller.cleanup()
         error_detection.stop()
         gpio_monitor.clear_gpio()
+        gpio_monitor.set_value(13, GPIOControl.LOW)
+        mcp.clear_all_outputs()
+        sock.close()
+        
