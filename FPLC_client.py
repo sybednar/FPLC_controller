@@ -2,7 +2,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 '''
-FPLC_client_0.2.5 (FPLC_controller) - Updated to add manual method control
+FPLC_client_0.3 (FPLC_controller) - Updated to add manual method control, error detection, wash method
 
 Functions:
 1) ADS1115 ADC data acquisition
