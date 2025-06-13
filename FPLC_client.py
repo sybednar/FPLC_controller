@@ -2,7 +2,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 '''
-FPLC_client_0.3 (FPLC_controller) - Updated to add manual method control, error detection, wash method
+FPLC_client_0.4 (FPLC_controller) - Updated to add PumpB and unified pump wash code
 
 Functions:
 1) ADS1115 ADC data acquisition
@@ -80,15 +80,20 @@ class MCP23017:
         self.OLATA = 0x14# Output latch register for port A
         self.OLATB = 0x15# Output latch register for port B
         self.GPPUA = 0x0C# Pull-up resistor config for port A
+        self.GPPUB = 0x0D# Pull-up resistor config for port B
 
         
-        # Set GPA0?GPA2 as outputs, GPA5?GPA7 as inputs
+        # For pump A Set GPA0, GPA1, GPA2 as outputs, GPA7 as inputs
         self.bus.write_byte_data(self.address, self.IODIRA, 0b10000000)
-        self.bus.write_byte_data(self.address, self.GPPUA, 0b10000000)
-
+        self.bus.write_byte_data(self.address, self.GPPUA, 0b10000000)     
+        self.set_pin_high('A', 0) #initialize GPA0 to HIGH (PumpA inactive wash)
+        self.set_pin_high('A', 2) #initialize GPA2 to HIGH (PumpA internal speed control)
         
-        self.set_pin_high('A', 0) #initialize GPA0 to HIGH (inactive wash)
-        self.set_pin_high('A', 2) #initialize GPA2 to HIGH (internal speed control)
+        # For pump B Set GPA0, GPB1, GPB2 as outputs, GPB3 as input
+        self.bus.write_byte_data(self.address, self.IODIRB, 0b11001000)
+        self.bus.write_byte_data(self.address, self.GPPUB, 0b11001000)      
+        self.set_pin_high('B', 0) #initialize GPB0 to HIGH (PumpB inactive wash)
+        self.set_pin_high('B', 2) #initialize GPB2 to HIGH (PumpB internal speed control)
 
 
     def set_pin_low(self, port, pin):
@@ -127,43 +132,77 @@ class MCP23017:
         print("MCP23017: All outputs cleared (set to LOW)")
 
 
-
-# ---------------- PumpA Control ----------------
-
-class SolventExchange_Pump_A:
+# ---------------- Pump Solvent Exchange Control ----------------
+class SolventExchangePumps:
     def __init__(self, mcp, sock, valve_controller):
         self.mcp = mcp
         self.sock = sock
         self.valve_controller = valve_controller
-        self.port = 'A'
-        self.pin_wash = 0# GPA0 controls wash start
-        self.pin_status = 7# GPA7 monitors wash status
-        self.pin_run = 1 # GPA1 controls pump run state
 
+        # Define pump configurations
+        self.pump_configs = {
+            "A": {
+                "port": 'A',
+                "pin_wash": 0,# GPA0 controls pumpA wash start
+                "pin_status": 7, # GPA7 monitors pumpA wash status
+                "pin_run": 1# GPA1 controls pumpA run state
+            },
+            "B": {
+                "port": 'B',
+                "pin_wash": 0,# GPB0 controls pumpB wash start
+                "pin_status": 3, # GPB3 monitors pumpB wash status
+                "pin_run": 1# GPB1 controls pumpB run state
+            }
+        }
 
-    def start_wash(self):
-        print("PumpA wash started")
+    def start_wash(self, pump_ids):
+        print(f"Starting solvent exchange for pumps: {pump_ids}")
         self.valve_controller.move_to_position("WASH")
-        self.mcp.set_pin_high(self.port, self.pin_run) # Set GPA1 HIGH = Run mode
-        self.mcp.set_pin_low(self.port, self.pin_wash)# Activate wash
-        if self.mcp.read_pin(self.port, self.pin_status) == 0:
-            print("pumpA wash program activated")
 
-    def monitor_wash(self):
-        # Continuously monitor GPA7 while GPA0 is LOW
-        while self.mcp.read_pin(self.port, self.pin_wash) == 0:
-            if self.mcp.read_pin(self.port, self.pin_status) == 1:
-                self.mcp.set_pin_high(self.port, self.pin_wash)# Deactivate wash
-                self.mcp.set_pin_low(self.port, self.pin_run) # Set GPA Low = Standby mode
-                self.valve_controller.move_to_position("LOAD")
-                print("pumpA wash program complete")
-                try:
-                    self.sock.sendall("PUMP_A_WASH_COMPLETED".encode('utf-8'))
-                    print("Sent wash completion message to server")
-                except socket.error as e:
-                    print(f"Socket send error: {e}")
-                break
-            time.sleep(0.5)# Polling interval
+        threads = []
+        completion_flags = {pid: threading.Event() for pid in pump_ids}
+
+        def monitor_pump(pump_id):
+            config = self.pump_configs[pump_id]
+            port = config["port"]
+            pin_wash = config["pin_wash"]
+            pin_status = config["pin_status"]
+            pin_run = config["pin_run"]
+
+            # Start wash
+            self.mcp.set_pin_high(port, pin_run)# Run mode
+            self.mcp.set_pin_low(port, pin_wash)# Activate wash
+            print(f"Pump{pump_id} wash started")
+
+            # Wait for wash to complete
+            while self.mcp.read_pin(port, pin_wash) == 0:
+                if self.mcp.read_pin(port, pin_status) == 1:
+                    self.mcp.set_pin_high(port, pin_wash)# Deactivate wash
+                    self.mcp.set_pin_low(port, pin_run)# Standby
+                    print(f"Pump{pump_id} wash complete")
+                    try:
+                        self.sock.sendall(f"PUMP_{pump_id}_WASH_COMPLETED".encode('utf-8'))
+                    except socket.error as e:
+                        print(f"Socket error: {e}")
+                    completion_flags[pump_id].set()
+                    break
+                time.sleep(0.5)
+
+        # Start threads for each pump
+        for pid in pump_ids:
+            t = threading.Thread(target=monitor_pump, args=(pid,), daemon=True)
+            threads.append(t)
+            t.start()
+
+        # Wait for all pumps to complete
+        for pid in pump_ids:
+            completion_flags[pid].wait()
+
+        # Move valve to LOAD after all washes complete
+        self.valve_controller.move_to_position("LOAD")
+        print("All washes complete. Valve moved to LOAD.")
+
+
 
 
 # ---------------- PumpA Flowrate Controller ----------------
@@ -207,7 +246,9 @@ class PumpAFlowrateController:
             self.stop_event.clear()
             self.thread = threading.Thread(target=self.run)
             self.thread.start()
-            self.error_monitor_thread.start()
+            if not self.error_monitor_thread.is_alive():
+                self.error_monitor_thread = threading.Thread(target=self.monitor_pump_error, daemon=True)
+                self.error_monitor_thread.start()
 
     def run(self): 
         start_time = time.time()
@@ -276,9 +317,11 @@ class PumpAFlowrateController:
                 self.data_acquisition.pause()
                 self.fraction_collector.pause()
                 self.fraction_collector.pause_fraction_collector()
+                self.send_pump_a_error_notification()
 
             elif previous_state == "HIGH" and current_state == "LOW":
                 print("PumpA error cleared (GPIO24 LOW)")
+                self.send_pump_a_error_cleared_notification()
                 self.resume()
                 self.data_acquisition.resume()
                 self.fraction_collector.resume()
@@ -286,6 +329,20 @@ class PumpAFlowrateController:
                 
             previous_state = current_state
             time.sleep(0.5)
+
+    def send_pump_a_error_notification(self):
+        try:
+            self.sock.sendall("PumpA error".encode('utf-8'))
+            print("Error notification sent to server")
+        except socket.error as e:
+            print(f"Socket send error: {e}")
+
+    def send_pump_a_error_cleared_notification(self):
+        try:
+            self.sock.sendall("PumpA Error has been cleared".encode('utf-8'))
+            print("Error cleared notification sent to server")
+        except socket.error as e:
+            print(f"Socket send error: {e}")
 
     def pause(self):
         print("PumpA paused")
@@ -647,11 +704,12 @@ if __name__ == '__main__':
  
             bus = SMBus(1)
             mcp = MCP23017(bus, 0x21)
-            mcp.set_pin_high('A', 0)# Set GPA0 HIGH to keep wash program inactive at startup
-            mcp.set_pin_high('A', 2)# Set GPA2 HIGH to keep wash program inactive at startup
+            mcp.set_pin_high('A', 0)# Set GPA0 HIGH to keep PumpA wash program inactive at startup
+            mcp.set_pin_high('A', 2)# Set GPA2 HIGH sets PumpA speed control to internal
+            mcp.set_pin_high('B', 0)# Set GPB0 HIGH to keep PumpB wash program inactive at startup
+            mcp.set_pin_high('B', 2)# Set GPB2 HIGH sets PumpB speed control to internal
 
-            valve_controller = MV7ValveController(gpio_monitor, mcp)
-            pump_a_wash = SolventExchange_Pump_A(mcp, sock, valve_controller)
+            valve_controller = MV7ValveController(gpio_monitor, mcp)          
             pump_a_flowrate_controller = PumpAFlowrateController(
                 gpio_monitor, 13, sock, mcp, data_acquisition, fraction_collector
             )
@@ -685,15 +743,15 @@ if __name__ == '__main__':
                 pump_a_flowrate_controller.set_volume_value(PumpA_volume_value)
                 print(f"Received PumpA volume: {PumpA_volume_value} ml")
 
-            elif signal == "WASH_PUMP_A":
-                print("Received Wash_PumpA signal")
-                pump_a_wash.start_wash()
-                pump_a_wash.monitor_wash()
-                #time.sleep(10)  # Duration of wash cycle
-                #pump_a.stop_wash()
-
-            elif signal == "WASH_PUMP_B":
-                print("Received Wash_PumpB signal")
+            elif signal.startswith("WASH_PUMPS_JSON:"):
+                try:
+                    wash_command = json.loads(signal.split(":", 1)[1])
+                    pumps = wash_command.get("WASH_PUMPS", [])
+                    solvent_exchange = SolventExchangePumps(mcp, sock, valve_controller)
+                    threading.Thread(target=solvent_exchange.start_wash, args=(pumps,),
+                    daemon=True).start()
+                except json.JSONDecodeError as e:
+                    print(f"Error decoding WASH_PUMPS_JSON: {e}")
 
             elif signal == "START_PUMPS":
                 print("Received start_pumps signal")
@@ -840,8 +898,12 @@ if __name__ == '__main__':
                     print(f"Error decoding METHOD_STOP_JSON: {e}")
             
 
-    except socket.error as e:
-        print(f"Socket error: {e}")
+    #except socket.error as e:
+        #print(f"Socket error: {e}")
+                    
+    
+    except KeyboardInterrupt:
+        print("\nKeyboardInterrupt received. Shutting down gracefully...")
 
     finally:
         heartbeat_sender.stop()
