@@ -2,7 +2,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 '''
-FPLC_client_0.4.2 (FPLC_controller) - added class GradientFlowrateController method logic and signaling
+FPLC_client_0.4.4 (FPLC_controller) - added class GradientFlowrateController method logic and signaling
 only handles pumpB 
 Functions:
 1) ADS1115 ADC data acquisition
@@ -305,6 +305,7 @@ class PumpAFlowrateController:
                 except socket.error as e:
                     print(f"Socket send error (STOP_SAVE_ACQUISITION): {e}")                
                 
+                self.stop_event.set()
                 self.stop()
 
     def monitor_pump_error(self):
@@ -370,146 +371,129 @@ class PumpAFlowrateController:
 
 
 # ---------------- Gradient Flowrate Controller ----------------
+
+
+
 class GradientFlowrateController:
-    def __init__(self, gpio_control, gpio_pinB, sock, mcp, data_acquisition, fraction_collector):
+    def __init__(self, gpio_control, gpio_pinA, gpio_pinB, sock, mcp, data_acquisition, fraction_collector):
         self.gpio_control = gpio_control
-        self.gpio_pinB = gpio_pinB #GPIO12 for PumpB
+        self.gpio_pinA = gpio_pinA
+        self.gpio_pinB = gpio_pinB
+        self.sock = sock
         self.mcp = mcp
+
         self.flowrate = 0.0
-        self.thread = None
+        self.total_volume = 0.0
+        self.volume_output = 0.0
+        self.pumpB_min_percent = 0.0
+        self.pumpB_max_percent = 100.0
+        self.min_toggle_freq = 1.0
+
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
-        self.pump_runtime = 0.0
-        self.volume_output = 0.0
-        self.PumpB_volume_value = 0.0
         self.pause_event.set()
+        
+        self.PumpA_volume_value = 0.0
         self.pause_start_time = None
         self.total_pause_duration = 0
+
+        self.freq_A = 0.0
+        self.freq_B = 0.0
         self.last_sent_volume = -0.1
-        self.sock = sock
+
+        self.thread = None
+        self.thread_A = None
+        self.thread_B = None
+        
         self.data_acquisition = data_acquisition
         self.fraction_collector = fraction_collector
         self.error_monitor_thread = threading.Thread(target=self.monitor_pump_error, daemon=True)
 
+    def set_gradient_profile(self, min_percent, max_percent):
+        self.pumpB_min_percent = min_percent
+        self.pumpB_max_percent = max_percent
+
     def set_flowrate(self, flowrate):
         self.flowrate = flowrate
-        
-    def set_volume_value(self, volume_value):
-        self.PumpB_volume_value = volume_value
 
-    def calculate_period(self):
-        frequency = self.flowrate * 18.315
-        frequency = max(0, min(frequency, 153))
-        return 1.0 / frequency if frequency > 0 else None
+    def set_volume_value(self, volume_value):
+        self.total_volume = volume_value
 
     def start(self):
         if self.thread is None or not self.thread.is_alive():
-            
-            print("Starting Gradient flowrate controller thread")
-
             self.stop_event.clear()
             self.thread = threading.Thread(target=self.run)
-            self.thread.start()
+            self.thread.start()            
             if not self.error_monitor_thread.is_alive():
                 self.error_monitor_thread = threading.Thread(target=self.monitor_pump_error, daemon=True)
                 self.error_monitor_thread.start()
-
-    def run(self): 
+         
+    def run(self):
+        print("[Gradient] run() started")
         start_time = time.time()
+        total_runtime = (self.total_volume / self.flowrate) * 60# seconds           
+            
+        def toggle_gpio(pin, get_freq, label):
+            while not self.stop_event.is_set():
+                self.pause_event.wait()
+                freq = get_freq()
+                print(f"[{label}] Toggling at {freq:.2f} Hz")
+                if freq >= self.min_toggle_freq:
+                    period = 1.0 / freq
+                    self.gpio_control.set_value(pin, GPIOControl.HIGH)
+                    time.sleep(period / 2)
+                    self.gpio_control.set_value(pin, GPIOControl.LOW)
+                    time.sleep(period / 2)
+                else:
+                    self.gpio_control.set_value(pin, GPIOControl.LOW)
+                    time.sleep(0.1)
+
+            print(f"[{label}] Exiting toggle thread.")
+
+        self.thread_A = threading.Thread(target=toggle_gpio, args=(self.gpio_pinA, lambda: self.freq_A, "PumpA"))
+        self.thread_B = threading.Thread(target=toggle_gpio, args=(self.gpio_pinB, lambda: self.freq_B, "PumpB"))
+        self.thread_A.start()
+        self.thread_B.start()
+
         while not self.stop_event.is_set():
             self.pause_event.wait()
-            period = self.calculate_period()
-            if period is None:
-                self.gpio_control.set_value(self.gpio_pinB, GPIOControl.LOW)
-                time.sleep(0.1)
-                continue
-            half_period = period / 2.0
-            self.gpio_control.set_value(self.gpio_pinB, GPIOControl.HIGH)
-            time.sleep(half_period)
-            self.gpio_control.set_value(self.gpio_pinB, GPIOControl.LOW)
-            time.sleep(half_period)
-            #print(f"Toggling GPIO{self.gpio_pinB} at {1/period:.2f} Hz")
-            
-            # Calculate runtime and volume output
-            self.pump_runtime = time.time() - start_time - self.total_pause_duration
-            self.volume_output = (self.flowrate/60) * self.pump_runtime
-            print(f"Volume Delivered {self.volume_output} ml")
-            
-            #Send volume update every 1 mL restore line if to not show if data acquisition is NOT running
-            current_volume_decile = round(self.volume_output*10) / 10.0
-            if current_volume_decile > self.last_sent_volume:
-                #if not (self.data_acquisition and self.data_acquisition.thread and self.data_acquisition.thread.is_alive()):
+            elapsed = time.time() - start_time - self.total_pause_duration
+            if elapsed > total_runtime:
+                break
+
+            # Interpolate flowrates
+            slope = (self.pumpB_max_percent - self.pumpB_min_percent) / total_runtime
+            pumpB_percent = self.pumpB_min_percent + slope * elapsed
+            pumpB_flow = self.flowrate * (pumpB_percent / 100.0)
+            pumpA_flow = self.flowrate - pumpB_flow
+
+            self.freq_A = min(max(pumpA_flow * 18.315, 0), 153)
+            self.freq_B = min(max(pumpB_flow * 18.315, 0), 153)
+
+            self.volume_output = (self.flowrate / 60) * elapsed
+            print(f"[Gradient] freq_A: {self.freq_A:.2f} Hz, freq_B: {self.freq_B:.2f} Hz")
+            print(f"[Gradient] Volume Delivered: {self.volume_output:.2f} ml")
+
+            if round(self.volume_output * 10) / 10.0 > self.last_sent_volume:
                 try:
                     self.sock.sendall(f"PumpB_running {self.volume_output:.2f} ml".encode('utf-8'))
-                    self.last_sent_volume = current_volume_decile
+                    self.last_sent_volume = round(self.volume_output * 10) / 10.0
                 except socket.error as e:
-                    print(f"Socket send error (PumpB_running): {e}")
+                    print(f"Socket send error: {e}")
+                    
+            # Check if volume output has reached the target and Stop
+            if self.volume_output >= self.total_volume:
+                print(f"[Gradient] Target volume {self.total_volume:.2f} ml reached. Stopping pumps.")
+                self.stop_event.set()
+                break
 
-            # Check if volume output has reached the target
-            if self.volume_output >= self.PumpB_volume_value:
-                print(f"Volume output {self.volume_output:.2f} ml has reached the target {self.PumpB_volume_value:.2f} ml")
-                self.mcp.set_pin_low('B', 1)# GPB1 LOW
-                self.mcp.set_pin_high('B', 2)# GPB2 HIGH
-                self.gpio_control.set_value(self.gpio_pinB, GPIOControl.LOW)# GPIO13 LOW
-                
-                #Notify server
-                try:
-                    self.sock.sendall("PumpB_stopped".encode('utf-8'))
-                except socket.error as e:
-                    print(f"Socket send error (PumpB_stopped): {e}")
-
-                #Stop acquisition and fraction collector if running
-                if self.data_acquisition and self.data_acquisition.thread and self.data_acquisition.thread.is_alive():
-                    self.data_acquisition.stop()
-                if self.fraction_collector and self.fraction_collector.thread and self.fraction_collector.thread.is_alive():
-                    self.fraction_collector.stop()
-                    self.fraction_collector.stop_fraction_collector()
-                try:
-                    self.sock.sendall("STOP_SAVE_ACQUISITION".encode('utf-8'))
-                except socket.error as e:
-                    print(f"Socket send error (STOP_SAVE_ACQUISITION): {e}")                
-                
-                self.stop()
-
-    def monitor_pump_error(self):
-        previous_state = self.gpio_control.monitor_input(25)
-        while not self.stop_event.is_set():
-            current_state = self.gpio_control.monitor_input(25)
-            if previous_state == "LOW" and current_state == "HIGH":
-                print("PumpB error detected (GPIO25 HIGH)")
-                self.pause()
-                self.data_acquisition.pause()
-                self.fraction_collector.pause()
-                self.fraction_collector.pause_fraction_collector()
-                self.send_pump_b_error_notification()
-
-            elif previous_state == "HIGH" and current_state == "LOW":
-                print("PumpB error cleared (GPIO25 LOW)")
-                self.send_pump_b_error_cleared_notification()
-                self.resume()
-                self.data_acquisition.resume()
-                self.fraction_collector.resume()
-                self.fraction_collector.resume_fraction_collector()
-                
-            previous_state = current_state
-            time.sleep(0.5)
-
-    def send_pump_b_error_notification(self):
-        try:
-            self.sock.sendall("PumpB error".encode('utf-8'))
-            print("Error notification sent to server")
-        except socket.error as e:
-            print(f"Socket send error: {e}")
-
-    def send_pump_b_error_cleared_notification(self):
-        try:
-            self.sock.sendall("PumpB Error has been cleared".encode('utf-8'))
-            print("Error cleared notification sent to server")
-        except socket.error as e:
-            print(f"Socket send error: {e}")
+            time.sleep(0.1)
+        print("[Gradient] run() exiting.")
+        self.stop()
+        
 
     def pause(self):
-        print("PumpB paused")
+        print("Gradient paused")
         self.pause_start_time = time.time()
         self.pause_event.clear()
 
@@ -518,19 +502,103 @@ class GradientFlowrateController:
             pause_duration = time.time() - self.pause_start_time
             self.total_pause_duration += pause_duration
             self.pause_start_time = None
-        print("PumpB resumed")
+        print("Gradient resumed")
         self.pause_event.set()
 
+    def monitor_pump_error(self):
+        prev_a = self.gpio_control.monitor_input(24)
+        prev_b = self.gpio_control.monitor_input(25)
+        while not self.stop_event.is_set():
+            curr_a = self.gpio_control.monitor_input(24)
+            curr_b = self.gpio_control.monitor_input(25)
+
+            if prev_a == "LOW" and curr_a == "HIGH":
+                print("PumpA error detected (GPIO24 HIGH)")
+                self.pause()               
+                self.data_acquisition.pause()
+                self.fraction_collector.pause()
+                self.fraction_collector.pause_fraction_collector()
+                self.send_pump_error_notification("PumpA")
+
+            elif prev_a == "HIGH" and curr_a == "LOW":
+                print("PumpA error cleared (GPIO24 LOW)")
+                self.send_pump_error_cleared_notification("PumpA")
+                self.resume()
+                self.data_acquisition.resume()
+                self.fraction_collector.resume()
+                self.fraction_collector.resume_fraction_collector()
+
+            if prev_b == "LOW" and curr_b == "HIGH":
+                print("PumpB error detected (GPIO25 HIGH)")
+                self.pause()
+                self.data_acquisition.pause()
+                self.fraction_collector.pause()
+                self.fraction_collector.pause_fraction_collector()               
+                self.send_pump_error_notification("PumpB")
+
+            elif prev_b == "HIGH" and curr_b == "LOW":
+                print("PumpB error cleared (GPIO25 LOW)")
+                self.send_pump_error_cleared_notification("PumpB")
+                self.resume()
+                self.data_acquisition.resume()
+                self.fraction_collector.resume()
+                self.fraction_collector.resume_fraction_collector()
+
+            prev_a, prev_b = curr_a, curr_b
+            time.sleep(0.5)
+            
+    def send_pump_error_notification(self, pump_id):
+        try:
+            message = f"{pump_id} error"
+            self.sock.sendall(message.encode('utf-8'))
+            print(f"Error notification sent to server: {message}")
+        except socket.error as e:
+            print(f"Socket send error ({pump_id} error): {e}")
+
+    def send_pump_error_cleared_notification(self, pump_id):
+        try:
+            message = f"{pump_id} Error has been cleared"
+            self.sock.sendall(message.encode('utf-8'))
+            print(f"Error cleared notification sent to server: {message}")
+        except socket.error as e:
+            print(f"Socket send error ({pump_id} cleared): {e}")
+
     def stop(self):
+        print("[Gradient] stop() called.")
         self.stop_event.set()
-        if self.thread is not None and self.thread.is_alive():
-            if threading.current_thread() != self.thread:
-                self.thread.join()
+        self.gpio_control.set_value(self.gpio_pinA, GPIOControl.LOW)
         self.gpio_control.set_value(self.gpio_pinB, GPIOControl.LOW)
+        self.mcp.set_pin_low('A', 1)
+        self.mcp.set_pin_high('A', 2)
+        self.mcp.set_pin_low('B', 1)
+        self.mcp.set_pin_high('B', 2)
+        
+        print("[Gradient] Joining toggle threads...")
+        if self.thread_A and self.thread_A.is_alive():
+            self.thread_A.join()
+            print("[Gradient] thread_A joined.")
+        if self.thread_B and self.thread_B.is_alive():
+            self.thread_B.join()
+            print("[Gradient] thread_B joined.")
+        if self.thread and self.thread.is_alive() and threading.current_thread() != self.thread:
+            self.thread.join()
+            print("[Gradient] main thread joined.")
+                #Stop acquisition and fraction collector if running
+        if self.data_acquisition and self.data_acquisition.thread and self.data_acquisition.thread.is_alive():
+            self.data_acquisition.stop()
+        if self.fraction_collector and self.fraction_collector.thread and self.fraction_collector.thread.is_alive():
+            self.fraction_collector.stop()
+            self.fraction_collector.stop_fraction_collector()      
+            try:          
+                self.sock.sendall("PumpB_stopped".encode('utf-8'))
+                self.sock.sendall("STOP_SAVE_ACQUISITION".encode('utf-8'))
+                print("[Gradient] Stop signals sent to server.")
+            except socket.error as e:
+                print(f"[Gradient] Socket send error: {e}")    
         self.thread = None
-        # Reset volume tracking for next run
         self.volume_output = 0.0
         self.last_sent_volume = -0.1
+        print("[Gradient] All threads joined. Shutdown complete.")
 
 
 # ---------------- Base Thread ----------------
@@ -884,7 +952,7 @@ if __name__ == '__main__':
             )
             
             gradient_flowrate_controller = GradientFlowrateController(
-                gpio_monitor, gpio_pinB, sock, mcp, data_acquisition, fraction_collector
+                gpio_monitor, gpio_pinA, gpio_pinB, sock, mcp, data_acquisition, fraction_collector
             )
            
             #Define GPIO-based error pins
@@ -1038,18 +1106,22 @@ if __name__ == '__main__':
                 try:
                     run_method = json.loads(signal.split(":", 1)[1])
                     flowrate = float(run_method.get("FLOWRATE", 0))
-                    volume = float(run_method.get("PumpB_Volume", 0))
+                    gradient_volume = float(run_method.get("GRADIENT_VOLUME", 0))
+                    pumpB_min_percent = float(run_method.get("PumpB_min_percent", 0))
+                    pumpB_max_percent = float(run_method.get("PumpB_max_percent", 100))
                     valve_position = run_method.get("System_Valve_Position", "LOAD")
-                    #gradient_profile = run_method.get("Gradient_Profile", [])
                     start_pumps = run_method.get("START_PUMPS", False)
                     start_adc = run_method.get("START_ADC", False)
+                    
+                    print(f"[Gradient JSON] FLOWRATE={flowrate}, VOLUME={gradient_volume}, "
+                        f"PumpB_min={pumpB_min_percent}%, PumpB_max={pumpB_max_percent}%, "
+                        f"Valve={valve_position}, START_PUMPS={start_pumps}, START_ADC={start_adc}")
 
-                    # Placeholder: apply gradient_profile logic here
-                    #print(f"Received gradient profile: {gradient_profile}")
-
+                    # Store parameters for gradient execution
                     data_acquisition.set_flowrate(flowrate)
                     gradient_flowrate_controller.set_flowrate(flowrate)
-                    gradient_flowrate_controller.set_volume_value(volume)
+                    gradient_flowrate_controller.set_volume_value(gradient_volume)
+                    gradient_flowrate_controller.set_gradient_profile(pumpB_min_percent, pumpB_max_percent)
 
                     try:
                         valve_controller.move_to_position(valve_position)
@@ -1057,8 +1129,12 @@ if __name__ == '__main__':
                         print(f"Valve movement error: {e}")
 
                     if start_pumps:
-                        mcp.set_pin_high('B', 1)
-                        mcp.set_pin_low('B', 2)
+                        # Enable PumpA (external speed control)
+                        mcp.set_pin_high('A', 1) # GPA1 HIGH = Run pumpA
+                        mcp.set_pin_low('A', 2) # GPA2 LOW = Enable external speed control pumpA
+                        # Enable PumpB (external speed control)
+                        mcp.set_pin_high('B', 1) # GPB1 HIGH = Run pumpB
+                        mcp.set_pin_low('B', 2) # GPB2 LOW = Enable external speed control pumpB
                         gradient_flowrate_controller.start()
                         monitor_thread_health(gradient_flowrate_controller, "GradientFlowrateController")
 
