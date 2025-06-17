@@ -2,9 +2,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 '''
-FPLC_client_0.4.4 (FPLC_controller) - added class GradientFlowrateController method logic and signaling
-only handles pumpB 
-Functions:
+FPLC_client_0.4.4 (FPLC_controller) -  added gradient volume delivered and diveter valve handling
 1) ADS1115 ADC data acquisition
 2) Communicate with FPLC_server_GUI
 3) Threading
@@ -94,6 +92,9 @@ class MCP23017:
         self.bus.write_byte_data(self.address, self.GPPUB, 0b11001000)      
         self.set_pin_high('B', 0) #initialize GPB0 to HIGH (PumpB inactive wash)
         self.set_pin_high('B', 2) #initialize GPB2 to HIGH (PumpB internal speed control)
+
+        # For Diverter valve set GPA6 as output
+        self.bus.write_byte_data(self.address, self.IODIRA, self.bus.read_byte_data(self.address, self.IODIRA) & ~(1 << 6))
 
 
     def set_pin_low(self, port, pin):
@@ -284,6 +285,10 @@ class PumpAFlowrateController:
             # Check if volume output has reached the target
             if self.volume_output >= self.PumpA_volume_value:
                 print(f"Volume output {self.volume_output:.2f} ml has reached the target {self.PumpA_volume_value:.2f} ml")
+                try:
+                    self.sock.sendall(f"PumpA_running {self.PumpA_volume_value:.2f} ml".encode('utf-8'))
+                except socket.error as e:
+                    print(f"Socket send error (final PumpA_running): {e}")
                 self.mcp.set_pin_low('A', 1)# GPA1 LOW
                 self.mcp.set_pin_high('A', 2)# GPA2 HIGH
                 self.gpio_control.set_value(self.gpio_pinA, GPIOControl.LOW)# GPIO13 LOW
@@ -387,7 +392,7 @@ class GradientFlowrateController:
         self.volume_output = 0.0
         self.pumpB_min_percent = 0.0
         self.pumpB_max_percent = 100.0
-        self.min_toggle_freq = 1.0
+        self.min_toggle_freq = 0.5
 
         self.stop_event = threading.Event()
         self.pause_event = threading.Event()
@@ -474,23 +479,31 @@ class GradientFlowrateController:
             print(f"[Gradient] freq_A: {self.freq_A:.2f} Hz, freq_B: {self.freq_B:.2f} Hz")
             print(f"[Gradient] Volume Delivered: {self.volume_output:.2f} ml")
 
-            if round(self.volume_output * 10) / 10.0 > self.last_sent_volume:
-                try:
-                    self.sock.sendall(f"PumpB_running {self.volume_output:.2f} ml".encode('utf-8'))
-                    self.last_sent_volume = round(self.volume_output * 10) / 10.0
-                except socket.error as e:
-                    print(f"Socket send error: {e}")
+            self.send_volume_update("Gradient_running", self.volume_output)
                     
             # Check if volume output has reached the target and Stop
-            if self.volume_output >= self.total_volume:
-                print(f"[Gradient] Target volume {self.total_volume:.2f} ml reached. Stopping pumps.")
+            #rounding ensures execution of print and sending of final volume
+            if round(self.volume_output, 2) >= round(self.total_volume, 2): 
+                print(f"[Gradient] Target volume {self.total_volume:.2f} ml reached. Stopping pumps.", flush=True)
+                try:
+                    self.sock.sendall(f"Gradient_running {self.total_volume:.2f} ml".encode('utf-8'))
+                except socket.error as e:
+                    print(f"Socket send error (final Gradient_running): {e}")
                 self.stop_event.set()
                 break
 
             time.sleep(0.1)
         print("[Gradient] run() exiting.")
         self.stop()
-        
+
+    def send_volume_update(self, label, volume):
+        current_volume_decile = round(volume * 10) / 10.0
+        if current_volume_decile > self.last_sent_volume:
+            try:
+                self.sock.sendall(f"{label} {volume:.2f} ml".encode('utf-8'))
+                self.last_sent_volume = current_volume_decile
+            except socket.error as e:
+                print(f"Socket send error ({label}): {e}")
 
     def pause(self):
         print("Gradient paused")
@@ -589,8 +602,7 @@ class GradientFlowrateController:
         if self.fraction_collector and self.fraction_collector.thread and self.fraction_collector.thread.is_alive():
             self.fraction_collector.stop()
             self.fraction_collector.stop_fraction_collector()      
-            try:          
-                self.sock.sendall("PumpB_stopped".encode('utf-8'))
+            try:
                 self.sock.sendall("STOP_SAVE_ACQUISITION".encode('utf-8'))
                 print("[Gradient] Stop signals sent to server.")
             except socket.error as e:
@@ -945,6 +957,7 @@ if __name__ == '__main__':
             mcp.set_pin_high('A', 2)# Set GPA2 HIGH sets PumpA speed control to internal
             mcp.set_pin_high('B', 0)# Set GPB0 HIGH to keep PumpB wash program inactive at startup
             mcp.set_pin_high('B', 2)# Set GPB2 HIGH sets PumpB speed control to internal
+            mcp.set_pin_low('A', 6) # GPA6 LOW (Diverter valve OFF at startup)
 
             valve_controller = MV7ValveController(gpio_monitor, mcp)          
             pump_a_flowrate_controller = PumpAFlowrateController(
@@ -993,6 +1006,14 @@ if __name__ == '__main__':
                     daemon=True).start()
                 except json.JSONDecodeError as e:
                     print(f"Error decoding WASH_PUMPS_JSON: {e}")
+
+            elif signal == "DIVERTER_VALVE_ON":
+                print("Turning diverter valve ON (GPA6 HIGH)")
+                mcp.set_pin_high('A', 6)
+
+            elif signal == "DIVERTER_VALVE_OFF":
+                print("Turning diverter valve OFF (GPA6 LOW)")
+                mcp.set_pin_low('A', 6)
 
             elif signal == "START_PUMPS":
                 print("Received start_pumps signal")
