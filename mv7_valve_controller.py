@@ -1,17 +1,18 @@
 
 #mv7_valve_controller.py
 
-
 import gpiod
 import time
+import socket
 from gpiod.line import Direction, Value, Bias
 
 class MV7ValveController:
-    def __init__(self, gpio_control, mcp):
+    def __init__(self, gpio_control, mcp, sock=None):
         self.gpio = gpio_control
         self.mcp = mcp
-        self.GPIO_DIRECTION = 27# LOW = CW, HIGH = CCW
-        self.GPIO_MOTOR = 17# LOW = motor ON, HIGH = motor OFF
+        self.sock = sock
+        self.GPIO_DIRECTION = 27# LOW = CCW, HIGH = CW
+        self.GPIO_MOTOR = 17# LOW = motor stop, HIGH = motor start
         self.GPIO_POSITION = 4# LOW = valve position reached
 
     def read_position(self):
@@ -42,14 +43,14 @@ class MV7ValveController:
         current_position = self.read_position()
         direction, steps = self.get_direction_and_steps(current_position, target_position)
         if direction is None:
-            print(f"Valve already in {current_position} position or invalid target.")
-            return
+            print(f"Valve already in {current_position} position")
+            return True #Already in position
 
-        self.gpio.set_value(self.GPIO_DIRECTION, Value.INACTIVE if direction == "CW" else Value.ACTIVE)
+        self.gpio.set_value(self.GPIO_DIRECTION, Value.ACTIVE if direction == "CW" else Value.INACTIVE)
         print(f"Direction set to {direction}, moving {steps} step(s)")
 
         for step in range(steps):
-            self.gpio.set_value(self.GPIO_MOTOR, Value.INACTIVE)
+            self.gpio.set_value(self.GPIO_MOTOR, Value.ACTIVE)
             print(f"Step {step + 1}: Motor activated")
             time.sleep(0.1)
 
@@ -65,11 +66,23 @@ class MV7ValveController:
             else:
                 print("Timeout: No position signal detected.")
 
-            self.gpio.set_value(self.GPIO_MOTOR, Value.ACTIVE)
+            self.gpio.set_value(self.GPIO_MOTOR, Value.INACTIVE)
             time.sleep(0.5)
-
+        self.gpio.set_value(self.GPIO_DIRECTION, Value.INACTIVE)
         new_position = self.read_position()
         print(f"New valve position = {new_position}")
+        
+        # Emit status to client.py and server
+        if hasattr(self, 'sock') and self.sock:
+            try:
+                if new_position != target_position:
+                    self.sock.sendall("Valve Malfunction".encode('utf-8'))
+                else:
+                    self.sock.sendall(f"VALVE_POSITION:{new_position}".encode('utf-8'))
+            except Exception as e:
+                print(f"Socket error sending valve status: {e}")
+
+        return new_position == target_position
 
     def cleanup(self):
         print("Valve controller cleanup complete (no GPIO lines to release).")

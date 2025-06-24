@@ -2,7 +2,8 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 '''
-FPLC_client_0.4.4 (FPLC_controller) -  added gradient volume delivered and diveter valve handling
+FPLC_client_0.4.6 (FPLC_controller) -  refactored method_stop_json
+added valve feedback and error detection 
 1) ADS1115 ADC data acquisition
 2) Communicate with FPLC_server_GUI
 3) Threading
@@ -24,6 +25,9 @@ import json
 from gpiod.line import Direction, Value, Bias
 from smbus2 import SMBus
 from mv7_valve_controller import MV7ValveController
+
+active_controller = None # for tracking which controller is active "isocratic" or "gradient"
+acquisition_started = False
 
 # ---------------- GPIO Control ----------------
 class GPIOControl:
@@ -158,7 +162,20 @@ class SolventExchangePumps:
 
     def start_wash(self, pump_ids):
         print(f"Starting solvent exchange for pumps: {pump_ids}")
-        self.valve_controller.move_to_position("WASH")
+
+        # Move valve to WASH and confirm position
+        try:
+            valve_success = self.valve_controller.move_to_position("WASH")
+        except Exception as e:
+            print(f"Valve movement error: {e}")
+            valve_success = False
+
+        if not valve_success:
+            print("Valve failed to reach WASH position. Aborting wash.")
+            return
+
+        print("Valve confirmed in WASH position. Proceeding with wash.")
+
 
         threads = []
         completion_flags = {pid: threading.Event() for pid in pump_ids}
@@ -305,10 +322,12 @@ class PumpAFlowrateController:
                 if self.fraction_collector and self.fraction_collector.thread and self.fraction_collector.thread.is_alive():
                     self.fraction_collector.stop()
                     self.fraction_collector.stop_fraction_collector()
-                try:
-                    self.sock.sendall("STOP_SAVE_ACQUISITION".encode('utf-8'))
-                except socket.error as e:
-                    print(f"Socket send error (STOP_SAVE_ACQUISITION): {e}")                
+                
+                if acquisition_started:
+                    try:
+                        self.sock.sendall("STOP_SAVE_ACQUISITION".encode('utf-8'))
+                    except socket.error as e:
+                        print(f"Socket send error (STOP_SAVE_ACQUISITION): {e}")                
                 
                 self.stop_event.set()
                 self.stop()
@@ -601,7 +620,8 @@ class GradientFlowrateController:
             self.data_acquisition.stop()
         if self.fraction_collector and self.fraction_collector.thread and self.fraction_collector.thread.is_alive():
             self.fraction_collector.stop()
-            self.fraction_collector.stop_fraction_collector()      
+            self.fraction_collector.stop_fraction_collector()       
+        if acquisition_started:
             try:
                 self.sock.sendall("STOP_SAVE_ACQUISITION".encode('utf-8'))
                 print("[Gradient] Stop signals sent to server.")
@@ -931,11 +951,10 @@ if __name__ == '__main__':
                 24: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP}, # PumpA error
                 16: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
                 26: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
-                17: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'},
+                17: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'}, # MV7 valve motor start/stop
                 13: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'},# PumpA flowrate control
                 4: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP},
-                17: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
-                27: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
+                27: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'},# MV7 valve rotation
                 25: {'direction': Direction.INPUT, 'bias': Bias.PULL_UP}, # PumpB error
                 12: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'} # PumpB flowrate control
             }
@@ -959,7 +978,7 @@ if __name__ == '__main__':
             mcp.set_pin_high('B', 2)# Set GPB2 HIGH sets PumpB speed control to internal
             mcp.set_pin_low('A', 6) # GPA6 LOW (Diverter valve OFF at startup)
 
-            valve_controller = MV7ValveController(gpio_monitor, mcp)          
+            valve_controller = MV7ValveController(gpio_monitor, mcp, sock)          
             pump_a_flowrate_controller = PumpAFlowrateController(
                 gpio_monitor, gpio_pinA, sock, mcp, data_acquisition, fraction_collector
             )
@@ -986,18 +1005,7 @@ if __name__ == '__main__':
         while True:
             signal = sock.recv(1024).decode('utf-8')
 
-            if signal.startswith("FLOWRATE:"):
-                flowrate_value = float(signal.split(":")[1])
-                data_acquisition.set_flowrate(flowrate_value)
-                pump_a_flowrate_controller.set_flowrate(flowrate_value)
-                print(f"Received flowrate: {flowrate_value} ml/min")
-
-            elif signal.startswith("PumpA_Volume:"):
-                PumpA_volume_value = float(signal.split(":")[1])
-                pump_a_flowrate_controller.set_volume_value(PumpA_volume_value)
-                print(f"Received PumpA volume: {PumpA_volume_value} ml")
-
-            elif signal.startswith("WASH_PUMPS_JSON:"):
+            if signal.startswith("WASH_PUMPS_JSON:"):
                 try:
                     wash_command = json.loads(signal.split(":", 1)[1])
                     pumps = wash_command.get("WASH_PUMPS", [])
@@ -1006,49 +1014,6 @@ if __name__ == '__main__':
                     daemon=True).start()
                 except json.JSONDecodeError as e:
                     print(f"Error decoding WASH_PUMPS_JSON: {e}")
-
-            elif signal == "DIVERTER_VALVE_ON":
-                print("Turning diverter valve ON (GPA6 HIGH)")
-                mcp.set_pin_high('A', 6)
-
-            elif signal == "DIVERTER_VALVE_OFF":
-                print("Turning diverter valve OFF (GPA6 LOW)")
-                mcp.set_pin_low('A', 6)
-
-            elif signal == "START_PUMPS":
-                print("Received start_pumps signal")
-                mcp.set_pin_high('A', 1)# GPA1 HIGH = Run
-                mcp.set_pin_low('A', 2)# GPA2 LOW = Enable external speed control
-                pump_a_flowrate_controller.start()
-                monitor_thread_health(pump_a_flowrate_controller, "PumpAFlowrateController")
-
-            elif signal == "STOP_PUMPS":
-                print("Received stop_pumps signal")
-                mcp.set_pin_low('A', 1)# GPA1 LOW = Standby
-                mcp.set_pin_high('A', 2)# GPA2 HIGH = Disable external speed control
-                pump_a_flowrate_controller.stop()
-
-            elif signal == "START_ADC":
-                print("Received START_ADC signal")
-                data_acquisition.stop_event.clear()
-                data_acquisition.resume()
-                data_acquisition.start()
-                fraction_collector.stop_event.clear()
-                fraction_collector.resume()
-                fraction_collector.start()
-                fraction_collector.start_fraction_collector()
-                error_detection.start()
-                monitor_thread_health(data_acquisition, "DataAcquisition")
-                monitor_thread_health(fraction_collector, "FractionCollector")
-
-            elif signal == "STOP_ADC":
-                print("Received STOP_ADC signal")
-                data_acquisition.stop()
-                data_acquisition.frac_collector_running = False
-                data_acquisition.frac_collector_start_time = None
-                fraction_collector.stop()
-                fraction_collector.stop_fraction_collector()
-                error_detection.stop()
 
             elif signal == "PAUSE_ADC":
                 print("Received PAUSE_ADC signal")
@@ -1064,16 +1029,7 @@ if __name__ == '__main__':
                 fraction_collector.resume()
                 fraction_collector.resume_fraction_collector()
                 pump_a_flowrate_controller.resume()
-                gradient_flowrate_controller.resume()
-                
-            elif signal.startswith("System_Valve_Position:"):
-                valve_position = signal.split(":")[1]
-                print(f"Received System Valve Position: {valve_position}")
-                try:
-                    valve_controller.move_to_position(valve_position)
-                except Exception as e:
-                    print(f"Valve movement error: {e}")
-                    
+                gradient_flowrate_controller.resume()                
 
             elif signal.startswith("ISOCRATIC_RUN_METHOD_JSON:"):
                 try:
@@ -1081,33 +1037,46 @@ if __name__ == '__main__':
 
                     # Extract and apply parameters
                     flowrate = float(run_method.get("FLOWRATE", 0))
-                    volume = float(run_method.get("PumpA_Volume", 0))
+                    volume = float(run_method.get("VOLUME", 0))
                     valve_position = run_method.get("System_Valve_Position", "LOAD")
                     start_pumps = run_method.get("START_PUMPS", False)
                     start_adc = run_method.get("START_ADC", False)
+                    diverter_valve_state = run_method.get("DIVERTER_VALVE", False)
 
-                    print(f"Received ISOCRATIC_RUN_METHOD_JSON: FLOWRATE={flowrate}, Volume={volume}, Valve={valve_position}, START_PUMPS={start_pumps}, START_ADC={start_adc}")
+                    print(f"Received ISOCRATIC_RUN_METHOD_JSON: FLOWRATE={flowrate}, "
+                        f"Volume={volume}, Valve={valve_position}, START_PUMPS={start_pumps}, "
+                        f"START_ADC={start_adc}, DIVERTER_VALVE={'ON' if diverter_valve_state else 'OFF'}")
 
                     # Apply flowrate and volume
                     data_acquisition.set_flowrate(flowrate)
                     pump_a_flowrate_controller.set_flowrate(flowrate)
                     pump_a_flowrate_controller.set_volume_value(volume)
 
-                    # Move valve
+                    # Move valve and confirm position
+                    valve_success = False
                     try:
-                        valve_controller.move_to_position(valve_position)
+                        valve_success = valve_controller.move_to_position(valve_position)
                     except Exception as e:
                         print(f"Valve movement error: {e}")
 
-                    # Start pumps
-                    if start_pumps:
+                    #Set diverter valve state
+                    if diverter_valve_state:
+                        mcp.set_pin_high('A', 6)
+                    else:
+                        mcp.set_pin_low('A', 6)
+
+                    # Start pumpA only if valve movement has been successfully completed
+                    if start_pumps and valve_success:
                         mcp.set_pin_high('A', 1)# GPA1 HIGH = Run
                         mcp.set_pin_low('A', 2)# GPA2 LOW = Enable external speed control
+                        active_controller = "isocratic"
                         pump_a_flowrate_controller.start()
                         monitor_thread_health(pump_a_flowrate_controller, "PumpAFlowrateController")
-
+                    elif start_pumps:
+                        print("Valve position not confirmed. PumpA will not start.")
                     # Start ADC and fraction collector
                     if start_adc:
+                        acquisition_started = True
                         data_acquisition.stop_event.clear()
                         data_acquisition.resume()
                         data_acquisition.start()
@@ -1127,16 +1096,18 @@ if __name__ == '__main__':
                 try:
                     run_method = json.loads(signal.split(":", 1)[1])
                     flowrate = float(run_method.get("FLOWRATE", 0))
-                    gradient_volume = float(run_method.get("GRADIENT_VOLUME", 0))
+                    gradient_volume = float(run_method.get("VOLUME", 0))
                     pumpB_min_percent = float(run_method.get("PumpB_min_percent", 0))
                     pumpB_max_percent = float(run_method.get("PumpB_max_percent", 100))
                     valve_position = run_method.get("System_Valve_Position", "LOAD")
                     start_pumps = run_method.get("START_PUMPS", False)
                     start_adc = run_method.get("START_ADC", False)
+                    diverter_valve_state = run_method.get("DIVERTER_VALVE", False)
                     
                     print(f"[Gradient JSON] FLOWRATE={flowrate}, VOLUME={gradient_volume}, "
                         f"PumpB_min={pumpB_min_percent}%, PumpB_max={pumpB_max_percent}%, "
-                        f"Valve={valve_position}, START_PUMPS={start_pumps}, START_ADC={start_adc}")
+                        f"Valve={valve_position}, START_PUMPS={start_pumps}, START_ADC={start_adc} "
+                        f"DIVERTER_VALVE={'ON' if diverter_valve_state else 'OFF'}")
 
                     # Store parameters for gradient execution
                     data_acquisition.set_flowrate(flowrate)
@@ -1144,22 +1115,35 @@ if __name__ == '__main__':
                     gradient_flowrate_controller.set_volume_value(gradient_volume)
                     gradient_flowrate_controller.set_gradient_profile(pumpB_min_percent, pumpB_max_percent)
 
+                    # Move valve and confirm position
+                    valve_success = False
                     try:
-                        valve_controller.move_to_position(valve_position)
+                        valve_success = valve_controller.move_to_position(valve_position)
                     except Exception as e:
                         print(f"Valve movement error: {e}")
 
-                    if start_pumps:
+                    #Set diverter valve state
+                    if diverter_valve_state:
+                        mcp.set_pin_high('A', 6)
+                    else:
+                        mcp.set_pin_low('A', 6)
+
+                    # Start pumpA and B only if valve movement has been successfully completed
+                    if start_pumps and valve_success:
                         # Enable PumpA (external speed control)
                         mcp.set_pin_high('A', 1) # GPA1 HIGH = Run pumpA
                         mcp.set_pin_low('A', 2) # GPA2 LOW = Enable external speed control pumpA
                         # Enable PumpB (external speed control)
                         mcp.set_pin_high('B', 1) # GPB1 HIGH = Run pumpB
                         mcp.set_pin_low('B', 2) # GPB2 LOW = Enable external speed control pumpB
+                        active_controller = "gradient"
                         gradient_flowrate_controller.start()
                         monitor_thread_health(gradient_flowrate_controller, "GradientFlowrateController")
-
+                    elif start_pumps:
+                        print("Valve position not confirmed. PumpA will not start.")
+                    # Start ADC and fraction collector
                     if start_adc:
+                        acquisition_started = True
                         data_acquisition.stop_event.clear()
                         data_acquisition.resume()
                         data_acquisition.start()
@@ -1170,6 +1154,7 @@ if __name__ == '__main__':
                         error_detection.start()
                         monitor_thread_health(data_acquisition, "DataAcquisition")
                         monitor_thread_health(fraction_collector, "FractionCollector")
+
                 except json.JSONDecodeError as e:
                     print(f"Error decoding GRADIENT_RUN_METHOD_JSON: {e}")
 
@@ -1182,46 +1167,48 @@ if __name__ == '__main__':
                     stop_method = json.loads(signal.split(":", 1)[1])
                     if stop_method.get("STOP_PUMPS"):
                         print("Stopping pumps as per METHOD_STOP_JSON")
-                        mcp.set_pin_low('A', 1)# GPA1 LOW = Standby
-                        mcp.set_pin_high('A', 2)# GPA2 HIGH = Disable external speed control
-                        mcp.set_pin_low('B', 1)# GPB1 LOW = Standby
-                        mcp.set_pin_high('B', 2)# GPB2 HIGH = Disable external speed control
+                        mcp.set_pin_low('A', 1)
+                        mcp.set_pin_high('A', 2)
+                        mcp.set_pin_low('B', 1)
+                        mcp.set_pin_high('B', 2)
                         pump_a_flowrate_controller.stop()
                         gradient_flowrate_controller.stop()
 
-                    valve_position = stop_method.get("System_Valve_Position", "LOAD")
-                    flowrate = float(stop_method.get("FLOWRATE", 0.0))
-                    volume = float(stop_method.get("PumpA_Volume", 0.0))
-                    volume = float(stop_method.get("PumpB_Volume", 0.0))
-                    stop_adc = stop_method.get("STOP_ADC", False)
+                        valve_position = stop_method.get("System_Valve_Position", "LOAD")
+                        flowrate = float(stop_method.get("FLOWRATE", 0.0))
+                        pumpA_volume = float(stop_method.get("PumpA_Volume", 0.0))
+                        pumpB_min = float(stop_method.get("PumpB_min_percent", 0.0))
+                        pumpB_max = float(stop_method.get("PumpB_max_percent", 0.0))
+                        stop_adc = stop_method.get("STOP_ADC", False)
+                        diverter_valve_state = stop_method.get("DIVERTER_VALVE")
 
-                    print(f"Resetting valve to {valve_position}, flowrate to {flowrate}, volume to {volume}")
-                    data_acquisition.set_flowrate(flowrate)
-                    pump_a_flowrate_controller.set_flowrate(flowrate)
-                    pump_a_flowrate_controller.set_volume_value(volume)
-                    gradient_flowrate_controller.set_flowrate(flowrate)
-                    gradient_flowrate_controller.set_volume_value(volume)
-                    if stop_adc:
-                        data_acquisition.stop()
-                        data_acquisition.frac_collector_running = False
-                        data_acquisition.frac_collector_start_time = None
-                        fraction_collector.stop()
-                        fraction_collector.stop_fraction_collector()
-                        error_detection.stop()
-                    
-                    try:
-                        valve_controller.move_to_position(valve_position)
-                    except Exception as e:
-                        print(f"Valve movement error: {e}")
+                        print(f"Resetting valve to {valve_position}, flowrate to {flowrate}, PumpA volume to {pumpA_volume}")
+                        print(f"PumpB gradient stop: Min = {pumpB_min}%, Max = {pumpB_max}%")
 
-                # Optional: Add GPIO/MCP logic to move valve to LOAD if needed
+                        data_acquisition.set_flowrate(flowrate)
+                        pump_a_flowrate_controller.set_flowrate(flowrate)
+                        pump_a_flowrate_controller.set_volume_value(pumpA_volume)
+                        gradient_flowrate_controller.set_flowrate(flowrate)
+                        gradient_flowrate_controller.set_volume_value(pumpA_volume)# reuse same volume
+
+                        if diverter_valve_state is False:
+                            mcp.set_pin_low('A', 6)
+
+                        if stop_adc:
+                            data_acquisition.stop()
+                            data_acquisition.frac_collector_running = False
+                            data_acquisition.frac_collector_start_time = None
+                            fraction_collector.stop()
+                            fraction_collector.stop_fraction_collector()
+                            error_detection.stop()
+
+                        try:
+                            valve_controller.move_to_position(valve_position)
+                        except Exception as e:
+                            print(f"Valve movement error: {e}")
                 except json.JSONDecodeError as e:
                     print(f"Error decoding METHOD_STOP_JSON: {e}")
-            
-
-    #except socket.error as e:
-        #print(f"Socket error: {e}")
-                    
+                               
     
     except KeyboardInterrupt:
         print("\nKeyboardInterrupt received. Shutting down gracefully...")
@@ -1234,7 +1221,7 @@ if __name__ == '__main__':
         valve_controller.cleanup()
         error_detection.stop()
         gpio_monitor.clear_gpio()
-        gpio_monitor.set_value(17, GPIOControl.HIGH) # Ensure valve motor stays OFF
+        gpio_monitor.set_value(17, GPIOControl.LOW) # Ensure valve motor stays OFF
         gpio_monitor.set_value(13, GPIOControl.LOW)
         gpio_monitor.set_value(12, GPIOControl.LOW)
         mcp.clear_all_outputs()

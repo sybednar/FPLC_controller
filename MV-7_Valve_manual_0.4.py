@@ -37,8 +37,8 @@ GPIO_POSITION = 4# Falling edge = valve position reached
 
 # Request output lines (GPIO27 and GPIO17)
 output_configs = {
-    GPIO_DIRECTION: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
-    GPIO_MOTOR: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'}
+    GPIO_DIRECTION: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'},
+    GPIO_MOTOR: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'}
 }
 output_request = {}
 
@@ -108,12 +108,12 @@ try:
     else:
         output_request[GPIO_DIRECTION].set_value(
             GPIO_DIRECTION,
-            gpiod.line.Value.INACTIVE if direction == "CW" else gpiod.line.Value.ACTIVE
+            gpiod.line.Value.ACTIVE if direction == "CW" else gpiod.line.Value.INACTIVE
         )
         print(f"Direction set to {direction}, moving {steps} step(s)")
 
         for step in range(steps):
-            output_request[GPIO_MOTOR].set_value(GPIO_MOTOR, Value.INACTIVE)
+            output_request[GPIO_MOTOR].set_value(GPIO_MOTOR, Value.ACTIVE)
             print(f"Step {step + 1}: Motor activated")
             time.sleep(0.1)
 
@@ -129,7 +129,7 @@ try:
             else:
                 print("Timeout: No position signal detected.")
 
-            output_request[GPIO_MOTOR].set_value(GPIO_MOTOR, Value.ACTIVE)
+            output_request[GPIO_MOTOR].set_value(GPIO_MOTOR, Value.INACTIVE)
             time.sleep(0.5)
 
         new_position = ReadValvePosition()
