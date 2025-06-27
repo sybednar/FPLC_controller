@@ -2,7 +2,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 '''
-FPLC_client_0.4.6 (FPLC_controller) -  refactored method_stop_json
+FPLC_client_0.4.7 (FPLC_controller) -  small mods to make compatible with FPLC_server ver 4.7
 added valve feedback and error detection 
 1) ADS1115 ADC data acquisition
 2) Communicate with FPLC_server_GUI
@@ -339,8 +339,10 @@ class PumpAFlowrateController:
             if previous_state == "LOW" and current_state == "HIGH":
                 print("PumpA error detected (GPIO24 HIGH)")
                 self.pause()
-                self.data_acquisition.pause()
-                self.fraction_collector.pause()
+                if self.data_acquisition:#addded ver 4.6.5
+                    self.data_acquisition.pause()
+                if self.fraction_collector:#addded ver 4.6.5
+                    self.fraction_collector.pause()
                 self.fraction_collector.pause_fraction_collector()
                 self.send_pump_a_error_notification()
 
@@ -348,8 +350,10 @@ class PumpAFlowrateController:
                 print("PumpA error cleared (GPIO24 LOW)")
                 self.send_pump_a_error_cleared_notification()
                 self.resume()
-                self.data_acquisition.resume()
-                self.fraction_collector.resume()
+                if self.data_acquisition:
+                    self.data_acquisition.resume()
+                if self.fraction_collector:
+                    self.fraction_collector.resume()
                 self.fraction_collector.resume_fraction_collector()
                 
             previous_state = current_state
@@ -702,20 +706,16 @@ class DataAcquisition(BaseThread):
             elapsed_time = time.time() - start_time - self.total_pause_duration
             eluate_volume = elapsed_time * (self.flowrate / 60)
 
-            if gpio23_status == 'LOW' and not self.frac_collector_running:
-                self.frac_collector_running = True
-                self.frac_collector_start_time = time.time()
-                print("Fraction collector started running")
-
-            if elapsed_time >= 1 and not self.frac_collector_running:
-                print("Fraction collector not running")
-
-            if gpio23_status == 'LOW' and previous_Frac_Mark_value == 0.0:
-                Frac_Mark = 1.0
-                previous_Frac_Mark_value = Frac_Mark
+            # Determine Frac_Mark only if fraction collector is running: block modified ver 0.4.6.5
+            if self.frac_collector_running:
+                if gpio23_status == 'LOW' and previous_Frac_Mark_value == 0.0:
+                    Frac_Mark = 1.0
+                    previous_Frac_Mark_value = Frac_Mark
+                else:
+                    Frac_Mark = 0.0
+                    previous_Frac_Mark_value = Frac_Mark
             else:
                 Frac_Mark = 0.0
-                previous_Frac_Mark_value = Frac_Mark
 
             data = f"{value1},{value2},{elapsed_time},{eluate_volume},{Frac_Mark}"
             try:
@@ -774,7 +774,10 @@ class FractionCollector(BaseThread):
             self.print_status('error')
             self.set_pin('start_stop', GPIOControl.HIGH)
             pump_a_flowrate_controller.pause()
-            data_acquisition.pause()
+            if self.data_acquisition: #addded ver 4.6.5
+                self.data_acquisition.pause()
+            if self.fraction_collector: #addded ver 4.6.5
+                self.fraction_collector.pause()
             self.send_error_notification()
             self.error_detected = True
 
@@ -784,6 +787,10 @@ class FractionCollector(BaseThread):
         print("Fraction Collector Error has been cleared")
         self.send_error_cleared_notification()
         pump_a_flowrate_controller.resume()
+        if self.data_acquisition:#addded ver 4.6.5
+            self.data_acquisition.resume()
+        if self.fraction_collector:#addded ver 4.6.5
+            self.fraction_collector.resume()
         data_acquisition.resume()
         self.set_pin('start_stop', GPIOControl.LOW)
         self.error_detected = False 
@@ -1041,6 +1048,7 @@ if __name__ == '__main__':
                     valve_position = run_method.get("System_Valve_Position", "LOAD")
                     start_pumps = run_method.get("START_PUMPS", False)
                     start_adc = run_method.get("START_ADC", False)
+                    start_frac = run_method.get("START_FRAC", False)
                     diverter_valve_state = run_method.get("DIVERTER_VALVE", False)
 
                     print(f"Received ISOCRATIC_RUN_METHOD_JSON: FLOWRATE={flowrate}, "
@@ -1074,19 +1082,23 @@ if __name__ == '__main__':
                         monitor_thread_health(pump_a_flowrate_controller, "PumpAFlowrateController")
                     elif start_pumps:
                         print("Valve position not confirmed. PumpA will not start.")
-                    # Start ADC and fraction collector
+                    # Start ADC and fraction collector revised block ver 0.4.6.5
                     if start_adc:
                         acquisition_started = True
                         data_acquisition.stop_event.clear()
                         data_acquisition.resume()
                         data_acquisition.start()
+                        monitor_thread_health(data_acquisition, "DataAcquisition")
+                        error_detection.start()
+
+                    if start_frac:
+                        data_acquisition.frac_collector_running = True
                         fraction_collector.stop_event.clear()
                         fraction_collector.resume()
                         fraction_collector.start()
                         fraction_collector.start_fraction_collector()
-                        error_detection.start()
-                        monitor_thread_health(data_acquisition, "DataAcquisition")
                         monitor_thread_health(fraction_collector, "FractionCollector")
+
 
                 except json.JSONDecodeError as e:
                     print(f"Error decoding ISOCRATIC_RUN_METHOD_JSON: {e}")
@@ -1102,6 +1114,7 @@ if __name__ == '__main__':
                     valve_position = run_method.get("System_Valve_Position", "LOAD")
                     start_pumps = run_method.get("START_PUMPS", False)
                     start_adc = run_method.get("START_ADC", False)
+                    start_frac = run_method.get("START_FRAC", False)
                     diverter_valve_state = run_method.get("DIVERTER_VALVE", False)
                     
                     print(f"[Gradient JSON] FLOWRATE={flowrate}, VOLUME={gradient_volume}, "
@@ -1141,20 +1154,24 @@ if __name__ == '__main__':
                         monitor_thread_health(gradient_flowrate_controller, "GradientFlowrateController")
                     elif start_pumps:
                         print("Valve position not confirmed. PumpA will not start.")
-                    # Start ADC and fraction collector
+ 
+                     # Start ADC and fraction collector revised block ver 0.4.6.5
                     if start_adc:
                         acquisition_started = True
                         data_acquisition.stop_event.clear()
                         data_acquisition.resume()
                         data_acquisition.start()
+                        monitor_thread_health(data_acquisition, "DataAcquisition")
+                        error_detection.start()
+
+                    if start_frac:
+                        data_acquisition.frac_collector_running = True
                         fraction_collector.stop_event.clear()
                         fraction_collector.resume()
                         fraction_collector.start()
                         fraction_collector.start_fraction_collector()
-                        error_detection.start()
-                        monitor_thread_health(data_acquisition, "DataAcquisition")
                         monitor_thread_health(fraction_collector, "FractionCollector")
-
+                                                
                 except json.JSONDecodeError as e:
                     print(f"Error decoding GRADIENT_RUN_METHOD_JSON: {e}")
 
@@ -1180,6 +1197,7 @@ if __name__ == '__main__':
                         pumpB_min = float(stop_method.get("PumpB_min_percent", 0.0))
                         pumpB_max = float(stop_method.get("PumpB_max_percent", 0.0))
                         stop_adc = stop_method.get("STOP_ADC", False)
+                        stop_frac = stop_method.get("STOP_FRAC", False)
                         diverter_valve_state = stop_method.get("DIVERTER_VALVE")
 
                         print(f"Resetting valve to {valve_position}, flowrate to {flowrate}, PumpA volume to {pumpA_volume}")
@@ -1195,12 +1213,14 @@ if __name__ == '__main__':
                             mcp.set_pin_low('A', 6)
 
                         if stop_adc:
+                            acquisition_started = False
                             data_acquisition.stop()
+                            error_detection.stop()
+                        if stop_frac:
                             data_acquisition.frac_collector_running = False
-                            data_acquisition.frac_collector_start_time = None
                             fraction_collector.stop()
                             fraction_collector.stop_fraction_collector()
-                            error_detection.stop()
+                            
 
                         try:
                             valve_controller.move_to_position(valve_position)
