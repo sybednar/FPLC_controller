@@ -2,8 +2,9 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 '''
-FPLC_client_0.4.7 (FPLC_controller) -  small mods to make compatible with FPLC_server ver 4.7
-added valve feedback and error detection 
+FPLC_client_0.4.9 (FPLC_controller) -
+small mods to make compatible with FPLC_server ver 4.9 including fraction collector error handling
+ 
 1) ADS1115 ADC data acquisition
 2) Communicate with FPLC_server_GUI
 3) Threading
@@ -13,7 +14,7 @@ added valve feedback and error detection
 7) Error detection and handling
 8) PumpA wash control via MCP23017 GPA0
 9) added valve control signal reception from FPLC_server
-
+10 v 0.4.7 added valve feedback and error detection
 '''
 
 import socket
@@ -740,10 +741,11 @@ class DataAcquisition(BaseThread):
 
 # ---------------- Fraction Collector ----------------
 class FractionCollector(BaseThread):
-    def __init__(self, gpio_control, sock):
+    def __init__(self, gpio_control, sock, data_acquisition):
         super().__init__()
         self.gpio_control = gpio_control
         self.sock = sock
+        self.data_acquisition = data_acquisition
         self.error_detected = False
         self.pins = {
             'operable_in': 5,
@@ -774,10 +776,10 @@ class FractionCollector(BaseThread):
             self.print_status('error')
             self.set_pin('start_stop', GPIOControl.HIGH)
             pump_a_flowrate_controller.pause()
-            if self.data_acquisition: #addded ver 4.6.5
+            if self.data_acquisition: #addded ver 0.4.6.5
                 self.data_acquisition.pause()
-            if self.fraction_collector: #addded ver 4.6.5
-                self.fraction_collector.pause()
+            self.pause()
+            self.pause_fraction_collector() #revised ver 0.4.7
             self.send_error_notification()
             self.error_detected = True
 
@@ -787,11 +789,9 @@ class FractionCollector(BaseThread):
         print("Fraction Collector Error has been cleared")
         self.send_error_cleared_notification()
         pump_a_flowrate_controller.resume()
-        if self.data_acquisition:#addded ver 4.6.5
+        if self.data_acquisition:
             self.data_acquisition.resume()
-        if self.fraction_collector:#addded ver 4.6.5
-            self.fraction_collector.resume()
-        data_acquisition.resume()
+        self.resume()
         self.set_pin('start_stop', GPIOControl.LOW)
         self.error_detected = False 
         if self.thread is None or not self.thread.is_alive():
@@ -975,7 +975,7 @@ if __name__ == '__main__':
             
 
             data_acquisition = DataAcquisition(adc, GAIN, sampling_rate, sock, gpio_monitor)
-            fraction_collector = FractionCollector(gpio_monitor, sock)
+            fraction_collector = FractionCollector(gpio_monitor, sock, data_acquisition)
  
             bus = SMBus(1)
             mcp = MCP23017(bus, 0x21)
