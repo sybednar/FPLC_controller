@@ -2,21 +2,39 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 '''
-FPLC_client_0.4.9 (FPLC_controller) -
-small mods to make compatible with FPLC_server ver 4.9 including fraction collector error handling
- 
-1) ADS1115 ADC data acquisition
-2) Communicate with FPLC_server_GUI
-3) Threading
-4) GPIO communication
-5) MCP23017 GPIO expander control
-6) Fraction Collector control
-7) Error detection and handling
-8) PumpA wash control via MCP23017 GPA0
-9) added valve control signal reception from FPLC_server
-10 v 0.4.7 added valve feedback and error detection
+FPLC_client_0.5.0 (FPLC_controller) -
+create eth0 local network (local server_ip = '192.168.10.1' , local client_ip = '192.168.10.2')
+current server_ip and _port settings in main_script line 940 and 941: server_ip = '192.168.10.1', server_port = 5000
+create separate eth1 for UWNet server_ip= '128.104.116.140', client_ip='128.104.116.138'
+
+add Blue LED boot_indicator (GPIO20) to device tree
+Edit the config.text file: sudo nano /boot/firmware/config.txt
+Append this line at the end of the file: 
+    # Custom boot indicator LED on GPIO20
+    dtoverlay=gpio-led,gpio=20,trigger=default-on,label=boot_indicator
+    
+systemd file for autostart:
+sudo nano /etc/systemd/system/fplc_client.service
+
+
+[Unit]
+Description=FPLC Client Service
+After=network.target
+
+[Service]
+Type=simple
+User=root
+
+WorkingDirectory=/home/sybednar/FPLC_client/FPLC_interface
+ExecStart=/home/sybednar/FPLC_client/bin/python /home/sybednar/FPLC_client/FPLC_interface/FPLC_client.py
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+
 '''
 
+import os
 import socket
 import threading
 import time
@@ -718,7 +736,23 @@ class DataAcquisition(BaseThread):
             else:
                 Frac_Mark = 0.0
 
-            data = f"{value1},{value2},{elapsed_time},{eluate_volume},{Frac_Mark}"
+            #data = f"{value1},{value2},{elapsed_time},{eluate_volume},{Frac_Mark}" replace this line with following code block
+            # Determine pumpB_percent based on active controller
+            if active_controller == "gradient":
+                # Estimate total runtime from volume and flowrate
+                total_volume = gradient_flowrate_controller.total_volume
+                flowrate = gradient_flowrate_controller.flowrate
+                total_runtime = (total_volume / flowrate) * 60 if flowrate > 0 else 1.0
+
+                slope = (gradient_flowrate_controller.pumpB_max_percent - gradient_flowrate_controller.pumpB_min_percent) / total_runtime
+                pumpB_percent = gradient_flowrate_controller.pumpB_min_percent + slope * elapsed_time
+            else:
+                pumpB_percent = 0.0
+
+
+            data = f"{value1},{value2},{elapsed_time},{eluate_volume},{Frac_Mark},{pumpB_percent}"
+            #code above added 092725           
+            
             try:
                 self.sock.sendall(data.encode('utf-8'))
             except socket.error as e:
@@ -901,9 +935,10 @@ class ErrorDetection(BaseThread):
 
 # ---------------- Heartbeat handling ----------------
 class HeartbeatSender(threading.Thread):
-    def __init__(self, sock, interval=5):
+    def __init__(self, sock, gpio_monitor, interval=5):
         super().__init__(daemon=True)
         self.sock = sock
+        self.gpio_monitor = gpio_monitor
         self.interval = interval
         self.running = True
 
@@ -912,8 +947,16 @@ class HeartbeatSender(threading.Thread):
             try:
                 self.sock.sendall("HEARTBEAT".encode('utf-8'))
                 print("[Client] Sent HEARTBEAT")
+                
+                # Blink green LED (GPIO19)
+                self.gpio_monitor.set_value(19, GPIOControl.LOW)
+                time.sleep(0.1)
+                self.gpio_monitor.set_value(19, GPIOControl.HIGH)
+                
             except socket.error as e:
                 print(f"[Client] Heartbeat send error: {e}")
+                self.gpio_monitor.set_value(19, GPIOControl.LOW) #Turn off green LED
+                self.gpio_monitor.set_value(21, GPIOControl.HIGH)  # Turn on red indicator LED; lost network connection
                 break
             time.sleep(self.interval)
 
@@ -937,7 +980,7 @@ if __name__ == '__main__':
     adc = Adafruit_ADS1x15.ADS1115(busnum=1)
     GAIN = 16
     sampling_rate = 10
-    server_ip = '128.104.117.228'
+    server_ip = '192.168.10.1'
     server_port = 5000
 
     # Connect to server
@@ -945,12 +988,11 @@ if __name__ == '__main__':
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.connect((server_ip, server_port))
-            print("Connected to server")
-            heartbeat_sender = HeartbeatSender(sock)
-            heartbeat_sender.start()
-                      
+            print("Connected to server")                     
 
             gpio_configs = {
+                21: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'},  # Blue Indicator LED; script running
+                19: {'direction': Direction.OUTPUT, 'initial_state': 'LOW'},  # Green Indicator LED; Network connected 
                 5: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
                 6: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
                 22: {'direction': Direction.OUTPUT, 'initial_state': 'HIGH'},
@@ -967,12 +1009,17 @@ if __name__ == '__main__':
             }
 
             gpio_monitor = GPIOControl('gpiochip0', gpio_configs)
-            #gpio_monitor.set_value(17, GPIOControl.LOW)
+            os.system("echo none > /sys/class/leds/boot_indicator/trigger")  # Disable kernel 
+            gpio_monitor.set_value(19, GPIOControl.HIGH)  # Turn on Green network connected LED
+
             gpio_monitor.set_value(5, GPIOControl.LOW)
             # GPIO pin assignments for flowrate control
             gpio_pinA = 13 # GPIO13 for PumpA flowrate control
             gpio_pinB = 12 # GPIO12 for PumpB flowrate control
             
+
+            heartbeat_sender = HeartbeatSender(sock, gpio_monitor)
+            heartbeat_sender.start()
 
             data_acquisition = DataAcquisition(adc, GAIN, sampling_rate, sock, gpio_monitor)
             fraction_collector = FractionCollector(gpio_monitor, sock, data_acquisition)
@@ -1046,6 +1093,7 @@ if __name__ == '__main__':
                     flowrate = float(run_method.get("FLOWRATE", 0))
                     volume = float(run_method.get("VOLUME", 0))
                     valve_position = run_method.get("System_Valve_Position", "LOAD")
+                    uv_monitor_type = run_method.get("UV_MONITOR_TYPE", "Pharmacia UV MII")
                     start_pumps = run_method.get("START_PUMPS", False)
                     start_adc = run_method.get("START_ADC", False)
                     start_frac = run_method.get("START_FRAC", False)
@@ -1059,6 +1107,12 @@ if __name__ == '__main__':
                     data_acquisition.set_flowrate(flowrate)
                     pump_a_flowrate_controller.set_flowrate(flowrate)
                     pump_a_flowrate_controller.set_volume_value(volume)
+                    
+                    # Set gain based on monitor type
+                    if uv_monitor_type == "Uvcord SII":
+                        data_acquisition.gain = 4
+                    else:
+                        data_acquisition.gain = 16
 
                     # Move valve and confirm position
                     valve_success = False
@@ -1068,7 +1122,7 @@ if __name__ == '__main__':
                         print(f"Valve movement error: {e}")
 
                     #Set diverter valve state
-                    if diverter_valve_state:
+                    if diverter_valve_state == "ON":
                         mcp.set_pin_high('A', 6)
                     else:
                         mcp.set_pin_low('A', 6)
@@ -1112,6 +1166,7 @@ if __name__ == '__main__':
                     pumpB_min_percent = float(run_method.get("PumpB_min_percent", 0))
                     pumpB_max_percent = float(run_method.get("PumpB_max_percent", 100))
                     valve_position = run_method.get("System_Valve_Position", "LOAD")
+                    uv_monitor_type = run_method.get("UV_MONITOR_TYPE", "Pharmacia UV MII")
                     start_pumps = run_method.get("START_PUMPS", False)
                     start_adc = run_method.get("START_ADC", False)
                     start_frac = run_method.get("START_FRAC", False)
@@ -1127,6 +1182,12 @@ if __name__ == '__main__':
                     gradient_flowrate_controller.set_flowrate(flowrate)
                     gradient_flowrate_controller.set_volume_value(gradient_volume)
                     gradient_flowrate_controller.set_gradient_profile(pumpB_min_percent, pumpB_max_percent)
+                    
+                    # Set gain based on monitor type
+                    if uv_monitor_type == "Uvcord SII":
+                        data_acquisition.gain = 4
+                    else:
+                        data_acquisition.gain = 16                    
 
                     # Move valve and confirm position
                     valve_success = False
@@ -1136,7 +1197,7 @@ if __name__ == '__main__':
                         print(f"Valve movement error: {e}")
 
                     #Set diverter valve state
-                    if diverter_valve_state:
+                    if diverter_valve_state == "ON":
                         mcp.set_pin_high('A', 6)
                     else:
                         mcp.set_pin_low('A', 6)
@@ -1208,9 +1269,8 @@ if __name__ == '__main__':
                         pump_a_flowrate_controller.set_volume_value(pumpA_volume)
                         gradient_flowrate_controller.set_flowrate(flowrate)
                         gradient_flowrate_controller.set_volume_value(pumpA_volume)# reuse same volume
-
-                        if diverter_valve_state is False:
-                            mcp.set_pin_low('A', 6)
+                        
+                        mcp.set_pin_low('A', 6) #set default: diverter valve off
 
                         if stop_adc:
                             acquisition_started = False
@@ -1245,5 +1305,7 @@ if __name__ == '__main__':
         gpio_monitor.set_value(13, GPIOControl.LOW)
         gpio_monitor.set_value(12, GPIOControl.LOW)
         mcp.clear_all_outputs()
+        gpio_monitor.set_value(20, GPIOControl.LOW)  # Turn off blue indicator LED
+        gpio_monitor.set_value(19, GPIOControl.LOW)  # Turn off green indicator LED
         sock.close()
         

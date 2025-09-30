@@ -1,5 +1,5 @@
 
-#mv7_valve_controller.py
+#mv7_valve_controller.py ver 0.5.0
 
 import gpiod
 import time
